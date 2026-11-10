@@ -10,16 +10,16 @@
 /* 多账号：每个游戏角色一行，可切换当前账号或解绑 */
 .account-list{border-top:1px solid #f0f3f2;margin:0 23px}
 .account-row{display:flex;align-items:center;gap:13px;padding:16px 0;border-bottom:1px solid #f4f7f6}
-.account-row.current{background:#f7fbf9;margin:0 -12px;padding:16px 12px;border-radius:9px}
+.account-row.current{background:rgba(120,190,170,.10);margin:0 -12px;padding:16px 12px;border-radius:9px;border-bottom-color:transparent}
 .account-main{flex:1;min-width:0}
 .account-main h3{margin:0;font-size:13px;color:#3c555b;display:flex;align-items:center;gap:8px}
 .account-main p{margin:6px 0 0;font-size:11px;color:#9dacac}
 .current-tag{font-size:10px;font-weight:400;color:#3f8b76;background:#e9f5ef;border-radius:4px;padding:3px 7px}
 .account-actions{display:flex;align-items:center;gap:8px;flex:none}
-.unbind{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 11px;border:1px solid #eddfdc;border-radius:8px;background:#fff;color:#a4685f;font-size:11px}
-.unbind:hover:not(:disabled){background:#fdf4f2;border-color:#e4cdc8}
+.unbind{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 11px;border:1px solid rgba(205,130,120,.38);border-radius:8px;background:transparent;color:#cf8f83;font-size:11px}
+.unbind:hover:not(:disabled){background:rgba(205,130,120,.14);border-color:rgba(205,130,120,.55)}
 .account-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 23px 0}
 .account-tip{font-size:11px;color:#a2b1b0}
-.account-error{display:flex;align-items:center;gap:8px;margin:14px 23px 0;padding:11px 13px;border-radius:8px;background:#fdf4f3;color:#a4605a;font-size:11px;border:1px solid #f0dcda}
+.account-error{display:flex;align-items:center;gap:8px;margin:14px 23px 0;padding:11px 13px;border-radius:8px;background:rgba(205,130,120,.12);color:#e0a197;font-size:11px;border:1px solid rgba(205,130,120,.32)}
 .account-select{height:30px;border:1px solid #dfe7e5;border-radius:7px;background:#fff;color:#5d7a76;font-size:11px;padding:0 7px;max-width:130px}
 @media(max-width:700px){.account-row{flex-wrap:wrap}.account-actions{width:100%;justify-content:flex-end}}

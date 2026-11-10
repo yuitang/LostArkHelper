@@ -34,7 +34,8 @@ def status(root, account_id=None):
     if not items:
         return {'configured': False, 'source': None, 'accounts': []}
     try:
-        account_id = accounts.resolve(root, account_id)
+        # 状态查询是只读的：多账号未指定时默认第一个角色，页面按返回值显示当前账号。
+        account_id = accounts.resolve(root, account_id, default_first=True)
     except accounts.AccountError as exc:
         return {'configured': False, 'source': None, 'accounts': items, 'error': str(exc)}
     current = next(item for item in items if item['id'] == account_id)

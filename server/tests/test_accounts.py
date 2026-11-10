@@ -120,10 +120,13 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([item['id'] for item in listed], ['456', '888'])
         self.assertEqual(len(self.request('/api/accounts')[1]['accounts']), 2)
 
-        # 多账号时状态查询必须显式指定，避免误读其他角色。
+        # 状态查询是只读的：多账号未指定时默认第一个角色，并返回该角色。
         status = self.request('/api/status')[1]
-        self.assertFalse(status['configured'])
-        self.assertIn('选择', status['error'])
+        self.assertTrue(status['configured'])
+        self.assertEqual(status['account']['id'], '456')
+        self.assertEqual(len(status['accounts']), 2)
+        # 写操作在多账号时必须显式指定，避免误操作其他角色。
+        self.assertEqual(self.request('/api/run', {})[0], 400)
         with patch.object(helper, 'sign_status', return_value=True), \
              patch.object(helper, 'tasks', return_value=[dict(id=1, type=1, name='任务', status=1)]):
             status = self.request('/api/status?account=888')[1]

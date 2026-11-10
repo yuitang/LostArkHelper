@@ -131,8 +131,11 @@ def exists(root, account_id):
     return (account_dir(root, account_id) / CONFIG).is_file()
 
 
-def resolve(root, account_id=None):
-    """确定要操作的账号：显式指定 > 唯一账号 > 报错，避免误操作其他角色。"""
+def resolve(root, account_id=None, default_first=False):
+    """确定要操作的账号：显式指定 > 唯一账号 > 报错，避免误操作其他角色。
+
+    default_first 仅供只读查询使用（如状态查询），写操作必须显式指定账号。
+    """
     items = list_accounts(root)
     if account_id:
         if not any(item['id'] == account_id for item in items):
@@ -140,7 +143,7 @@ def resolve(root, account_id=None):
         return account_id
     if not items:
         raise AccountError('请先导入自己的游戏账号。')
-    if len(items) > 1:
+    if len(items) > 1 and not default_first:
         raise AccountError('你有多个游戏账号，请先选择一个账号再操作。')
     return items[0]['id']
 
