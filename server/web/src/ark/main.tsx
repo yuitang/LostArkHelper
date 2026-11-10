@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
-  AlertCircle, Anchor, ArrowRight, CalendarCheck, Check, CheckCircle2, ChevronRight, Clock3,
-  Compass, Gift, LayoutDashboard, LoaderCircle, LogOut, RefreshCw, ScrollText,
+  AlertCircle, Anchor, ArrowRight, CalendarCheck, Check, CheckCircle2, ChevronRight, CircleDashed, Clock3,
+  Compass, Gift, LayoutDashboard, LoaderCircle, LogOut, Minus, RefreshCw, ScrollText,
   Settings2, ShieldCheck, Sparkles, UsersRound, X, Zap,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -33,12 +33,59 @@ const pageCopy: Record<Page, { title: string; lead: string }> = {
 }
 const apiFetch = window.fetch.bind(window)
 
-function StatCard({ icon, tone: color, label, value, hint }: {
-  icon: React.ReactNode; tone: string; label: string; value: string; hint: string
+type StatusKey = 'ready' | 'done' | 'todo' | 'ended'
+// 任务状态：文字 + 图标 + 填充方式三者对应，保证不靠颜色也能分辨。
+const statusMap: Record<StatusKey, { label: string; icon: React.ComponentType<{ size?: number; strokeWidth?: number }> }> = {
+  ready: { label: '可领取', icon: Gift },
+  done: { label: '已完成', icon: Check },
+  todo: { label: '未完成', icon: CircleDashed },
+  ended: { label: '已结束', icon: Minus },
+}
+function statusOf(task: Task): StatusKey {
+  return task.status === 1 ? 'ready' : task.status === 2 ? 'done' : task.status === 3 ? 'ended' : 'todo'
+}
+const statusOrder: Record<StatusKey, number> = { ready: 0, todo: 1, done: 2, ended: 3 }
+
+function TaskRow({ task, meta }: { task: Task; meta: string }) {
+  const key = statusOf(task)
+  const { label, icon: Icon } = statusMap[key]
+  return <div className={'task ' + key}>
+    <div className={'task-icon ' + key}><Icon size={16} strokeWidth={2.2}/></div>
+    <div className="task-name"><b>{task.name}</b><span>{meta}</span></div>
+    <span className={'task-status ' + key}><Icon size={11} strokeWidth={2.8}/>{label}</span>
+  </div>
+}
+
+// 进度条 + 图例：一眼看出这份列表里已完成/可领取/未完成各占多少。
+function TaskSummary({ tasks }: { tasks: Task[] }) {
+  const total = tasks.length
+  if (!total) return null
+  const count = (key: StatusKey) => tasks.filter(t => statusOf(t) === key).length
+  const done = count('done'), ready = count('ready'), todo = total - done - ready
+  const share = (n: number) => ({ width: (n / total) * 100 + '%' })
+  return <div className="task-summary">
+    <div className="task-bar" role="img"
+      aria-label={`共 ${total} 项：已完成 ${done}，可领取 ${ready}，未完成 ${todo}`}>
+      {done > 0 && <i className="done" style={share(done)}/>}
+      {ready > 0 && <i className="ready" style={share(ready)}/>}
+      {todo > 0 && <i className="todo" style={share(todo)}/>}
+    </div>
+    <div className="task-legend">
+      <span className="done"><i/>已完成 {done}</span>
+      <span className="ready"><i/>可领取 {ready}</span>
+      <span className="todo"><i/>未完成 {todo}</span>
+    </div>
+  </div>
+}
+
+function StatCard({ icon, tone: color, label, value, hint, meter }: {
+  icon: React.ReactNode; tone: string; label: string; value: string; hint: string; meter?: number
 }) {
-  return <div className="stat-card">
+  return <div className={'stat-card tone-' + color}>
     <span className={'stat-icon ' + color}>{icon}</span>
-    <div className="stat-copy"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>
+    <div className="stat-copy"><span>{label}</span><strong>{value}</strong><small>{hint}</small>
+      {meter !== undefined && <div className="stat-meter" role="presentation"><i style={{ width: Math.round(meter * 100) + '%' }}/></div>}
+    </div>
   </div>
 }
 
@@ -52,6 +99,7 @@ function Dashboard({ user, onLogout }: { user: { username: string; is_admin?: bo
   const [accounts, setAccounts] = useState<GameAccount[]>([])
   const [active, setActive] = useState('')
   const [taskFilter, setTaskFilter] = useState('')
+  const [stateFilter, setStateFilter] = useState<'all' | StatusKey>('all')
 
   // 刷新只查询当前角色的状态；账号列表随响应一起更新，避免额外请求。
   async function refresh(target?: string) {
@@ -94,7 +142,13 @@ function Dashboard({ user, onLogout }: { user: { username: string; is_admin?: bo
     ...(user.is_admin ? [{ key: 'admin' as Page, label: '用户管理' }] : []),
   ]
   const visible = taskFilter ? tasks.filter(t => String(t.type) === taskFilter) : tasks
-  const ordered = visible.filter(t => t.status === 1).concat(visible.filter(t => t.status !== 1))
+  const shown = stateFilter === 'all' ? visible : visible.filter(t => statusOf(t) === stateFilter)
+  // 可领取排最前，其次待完成，已完成与已结束沉底，方便自上而下扫读。
+  const ordered = [...shown].sort((a, b) => statusOrder[statusOf(a)] - statusOrder[statusOf(b)])
+  // 总览只放几条预览：待处理优先，但保留已完成项，让两种状态同屏可比。
+  const pendingPreview = ordered.filter(t => statusOf(t) === 'ready' || statusOf(t) === 'todo').slice(0, 3)
+  const donePreview = ordered.filter(t => statusOf(t) === 'done' || statusOf(t) === 'ended').slice(0, 2)
+  const doneRatio = tasks.length ? claimed.length / tasks.length : 0
 
   return <div className="app dashboard-rays">
     <div className="dashboard-rays-background" aria-hidden="true">
@@ -184,7 +238,9 @@ function Dashboard({ user, onLogout }: { user: { username: string; is_admin?: bo
               <StatCard icon={<Gift size={21}/>} tone="blue" label="可领取任务"
                 value={data.tasks ? `${ready.length} 项` : '—'} hint="仅领取白名单中的任务"/>
               <StatCard icon={<CheckCircle2 size={21}/>} tone="green" label="已完成任务"
-                value={data.tasks ? `${claimed.length} 项` : '—'} hint="按当前接口状态推测"/>
+                value={data.tasks ? `${claimed.length} / ${tasks.length} 项` : '—'}
+                hint={data.tasks ? `完成度 ${Math.round(doneRatio * 100)}%` : '按当前接口状态推测'}
+                meter={data.tasks ? doneRatio : undefined}/>
             </section>
 
             <div className="main-grid">
@@ -196,12 +252,17 @@ function Dashboard({ user, onLogout }: { user: { username: string; is_admin?: bo
                   : !data.configured ? <div className="empty"><UsersRound size={23}/><b>先连接你的账号</b><span>导入活动分享链接后，即可查询任务。</span>
                     <button className="text-btn" onClick={() => setPage('accounts')}>前往账号管理 <ArrowRight size={14}/></button></div>
                   : !data.tasks ? <div className="empty"><LoaderCircle className="spin" size={23}/><span>正在获取活动信息…</span></div>
-                  : <div className="task-list">{ordered.slice(0, 5).map(task => <div className="task" key={task.id}>
-                      <div className={'task-icon ' + (task.status === 1 ? 'ready' : '')}><Check size={16}/></div>
-                      <div className="task-name"><b>{task.name}</b><span>{groups[task.type] || '其他任务'} · 活跃值 +{task.exp ?? '—'}</span></div>
-                      <span className={'task-status ' + (task.status === 1 ? 'available' : '')}>
-                        {task.status === 1 ? '可领取' : task.status === 2 ? '已完成' : task.status === 3 ? '已结束' : '未完成'}</span>
-                    </div>)}{tasks.length === 0 && <div className="empty">暂无任务数据</div>}</div>}
+                  : <><TaskSummary tasks={tasks}/>
+                    <div className="task-list">
+                      {pendingPreview.map(task =>
+                        <TaskRow key={task.id} task={task} meta={`${groups[task.type] || '其他任务'} · 活跃值 +${task.exp ?? '—'}`}/>)}
+                      {donePreview.length > 0 && <>
+                        <div className="task-divider"><span>已完成 {claimed.length} 项</span></div>
+                        {donePreview.map(task =>
+                          <TaskRow key={task.id} task={task} meta={`${groups[task.type] || '其他任务'} · 活跃值 +${task.exp ?? '—'}`}/>)}
+                      </>}
+                      {tasks.length === 0 && <div className="empty">暂无任务数据</div>}
+                    </div></>}
               </section>
               <aside className="right-column">
                 <section className="panel action-panel">
@@ -228,19 +289,26 @@ function Dashboard({ user, onLogout }: { user: { username: string; is_admin?: bo
                 .map(item => <button key={item.key} role="tab" aria-selected={taskFilter === item.key}
                   className={'filter-chip plain' + (taskFilter === item.key ? ' on' : '')} onClick={() => setTaskFilter(item.key)}>{item.label}</button>)}
             </div>
+            <div className="filter-row task-filters" role="tablist" aria-label="完成状态">
+              <span className="filter-label"><CheckCircle2 size={13}/>状态</span>
+              {([{ key: 'all', label: '全部' }, { key: 'ready', label: '可领取' }, { key: 'todo', label: '未完成' },
+                { key: 'done', label: '已完成' }, { key: 'ended', label: '已结束' }] as { key: 'all' | StatusKey; label: string }[])
+                .map(item => <button key={item.key} role="tab" aria-selected={stateFilter === item.key}
+                  className={'filter-chip plain status-' + item.key + (stateFilter === item.key ? ' on' : '')}
+                  onClick={() => setStateFilter(item.key)}>
+                  {item.key !== 'all' && <i className={'legend-dot ' + item.key}/>}{item.label}</button>)}
+            </div>
             <section className="panel task-panel activity-panel">
               <div className="panel-head"><div><h2>{current ? current.role + ' · 任务' : '任务列表'}</h2>
-                <p>{data.tasks ? `共 ${visible.length} 项，其中 ${visible.filter(t => t.status === 1).length} 项可领取` : '等待查询当前角色'}</p></div></div>
+                <p>{data.tasks ? `共 ${visible.length} 项${taskFilter ? '（' + (groups[Number(taskFilter)] || '') + '）' : ''}` : '等待查询当前角色'}</p></div></div>
               {data.error ? <div className="empty"><AlertCircle size={22}/><b>暂时无法获取任务</b><span>{data.error}</span></div>
                 : !data.configured ? <div className="empty"><UsersRound size={23}/><b>还没有绑定账号</b><span>导入活动分享链接后即可查看任务。</span>
                   <button className="text-btn" onClick={() => setPage('accounts')}>前往账号管理 <ArrowRight size={14}/></button></div>
                 : !data.tasks ? <div className="empty"><LoaderCircle className="spin" size={23}/><span>正在获取活动信息…</span></div>
-                : <div className="task-list wide">{ordered.map(task => <div className="task" key={task.id}>
-                    <div className={'task-icon ' + (task.status === 1 ? 'ready' : '')}><Check size={16}/></div>
-                    <div className="task-name"><b>{task.name}</b><span>{groups[task.type] || '其他任务'} · 活跃值 +{task.exp ?? '—'} · #{task.id}</span></div>
-                    <span className={'task-status ' + (task.status === 1 ? 'available' : '')}>
-                      {task.status === 1 ? '可领取' : task.status === 2 ? '已完成' : task.status === 3 ? '已结束' : '未完成'}</span>
-                  </div>)}{visible.length === 0 && <div className="empty">该类型下暂无任务</div>}</div>}
+                : <><TaskSummary tasks={visible}/>
+                  <div className="task-list wide">{ordered.map(task =>
+                    <TaskRow key={task.id} task={task} meta={`${groups[task.type] || '其他任务'} · 活跃值 +${task.exp ?? '—'} · #${task.id}`}/>)}
+                  {shown.length === 0 && <div className="empty">该筛选下暂无任务</div>}</div></>}
             </section>
           </>}
         </>}

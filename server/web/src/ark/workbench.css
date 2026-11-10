@@ -169,13 +169,23 @@
 
 /* ---------- 今日进度卡片 ---------- */
 .dashboard-rays .status-grid { border-radius: var(--w-radius); overflow: hidden; }
-.stat-card { display: flex; align-items: center; gap: 14px; padding: 21px 22px; }
+.stat-card { display: flex; align-items: center; gap: 14px; padding: 21px 22px; position: relative; }
 .stat-card + .stat-card { border-left: 1px solid var(--w-line-soft); }
 .stat-icon { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 12px; flex: none; }
 .stat-copy { min-width: 0; }
 .stat-copy span { display: block; font-size: 11px; color: var(--w-muted); }
 .stat-copy strong { display: block; font-size: 18px; color: var(--w-ink); margin: 5px 0 4px; letter-spacing: -.01em; }
 .stat-copy small { display: block; font-size: 10px; color: #8ba4a0; }
+/* 三张卡各带一条左侧色条，数值同色，避免“三块一样的灰板” */
+.stat-card::before { content: ''; position: absolute; left: 0; top: 22%; bottom: 22%; width: 2px; border-radius: 2px; }
+.stat-card.tone-gold::before { background: var(--w-gold); }
+.stat-card.tone-blue::before { background: #7fb9cb; }
+.stat-card.tone-green::before { background: #6fc79b; }
+.stat-card.tone-gold .stat-copy strong { color: var(--w-gold); }
+.stat-card.tone-blue .stat-copy strong { color: #8fd0e2; }
+.stat-card.tone-green .stat-copy strong { color: #94e0b8; }
+.stat-meter { margin-top: 9px; height: 5px; border-radius: 999px; overflow: hidden; background: rgba(120, 160, 160, .18); }
+.stat-meter i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #55ad88, #8ed9b4); }
 
 /* ---------- 筛选条 ---------- */
 .filter-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
@@ -189,8 +199,77 @@
 .filter-chip.on { border-color: rgba(237, 207, 146, .55); background: rgba(237, 207, 146, .12); color: var(--w-gold); }
 .filter-chip .acct-avatar { width: 20px; height: 20px; font-size: 10px; border-radius: 6px; }
 .task-filters { margin-top: 2px; }
-.activity-panel .task-list.wide { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 0 26px; }
-.activity-panel .task-list.wide .task { border-top: 1px solid var(--w-line-soft); }
+.activity-panel .task-list.wide { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 8px 22px; align-content: start; }
+.activity-panel .task-list.wide .task { border-top: 0; }
+.activity-panel .task-list.wide .empty { grid-column: 1 / -1; }
+
+/* ---------- 任务状态：形状（实心 / 虚框 / 灰底）+ 图标 + 色条，三重区分 ---------- */
+.dashboard-rays .task-list { display: grid; gap: 8px; padding: 0 18px 16px; }
+.dashboard-rays .task-list .empty { padding: 12px 5px; min-height: 0; }
+.dashboard-rays .task {
+  position: relative; gap: 12px; padding: 11px 13px; border: 1px solid transparent;
+  border-top: 0; border-radius: 11px; overflow: hidden;
+  transition: background .15s, border-color .15s;
+}
+/* 左侧状态色条：可领取=金，已完成=青绿，未完成/已结束不设色条以保持“空”的观感 */
+.dashboard-rays .task::before {
+  content: ''; position: absolute; left: 0; top: 9px; bottom: 9px; width: 3px;
+  border-radius: 0 3px 3px 0; background: transparent;
+}
+.dashboard-rays .task.ready { background: linear-gradient(90deg, rgba(237, 207, 146, .13), rgba(237, 207, 146, .028)); border-color: rgba(237, 207, 146, .3); }
+.dashboard-rays .task.ready::before { background: var(--w-gold); }
+.dashboard-rays .task.done { background: rgba(113, 199, 160, .07); border-color: rgba(113, 199, 160, .2); }
+.dashboard-rays .task.done::before { background: #71c7a0; }
+.dashboard-rays .task.todo { background: rgba(255, 255, 255, .028); border-color: rgba(150, 178, 175, .17); }
+.dashboard-rays .task.ended { background: transparent; border-color: rgba(150, 178, 175, .1); }
+
+/* 图标方块：已完成为实心青绿、未完成为虚线空心圈、已结束为压平的灰块 */
+.dashboard-rays .task-icon { position: relative; z-index: 1; width: 34px; height: 34px; border-radius: 10px; border: 1px solid transparent; }
+.dashboard-rays .task-icon.ready { background: #3f3a29; border-color: rgba(237, 207, 146, .42); color: var(--w-gold); }
+.dashboard-rays .task-icon.done { background: #204d3b; border-color: rgba(113, 199, 160, .46); color: #b7eccd; }
+.dashboard-rays .task-icon.todo { background: transparent; border: 1px dashed rgba(160, 186, 182, .55); color: #9fb6b1; }
+.dashboard-rays .task-icon.ended { background: rgba(120, 140, 138, .13); border-color: transparent; color: #839792; }
+
+.dashboard-rays .task-name { position: relative; z-index: 1; }
+.dashboard-rays .task-name b { font-size: 12.5px; font-weight: 500; color: #f1f4ea; }
+.dashboard-rays .task.todo .task-name b { color: #f5f7ef; }
+.dashboard-rays .task.done .task-name b { color: #cfe2d9; }
+.dashboard-rays .task.ended .task-name b { color: #8a9d97; text-decoration: line-through; text-decoration-color: rgba(138, 157, 151, .6); }
+.dashboard-rays .task.ended .task-name span { color: #7e918c; }
+
+/* 状态标签：可领取=金色实心，已完成=青绿描边+实心勾，未完成=虚线空心，已结束=灰底无边框 */
+.dashboard-rays .task-status {
+  position: relative; z-index: 1; flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 9px; border: 1px solid transparent; border-radius: 6px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em; white-space: nowrap;
+}
+.dashboard-rays .task-status.ready { background: #e7ca90; color: #1e3238; }
+.dashboard-rays .task-status.done { background: rgba(113, 199, 160, .16); border-color: rgba(113, 199, 160, .5); color: #b7eccd; }
+.dashboard-rays .task-status.todo { background: transparent; border-style: dashed; border-color: rgba(160, 186, 182, .52); color: #c6d6d0; }
+.dashboard-rays .task-status.ended { background: rgba(120, 140, 138, .14); color: #8b9f9a; }
+
+/* ---------- 任务进度条 + 图例 ---------- */
+.task-summary { display: flex; align-items: center; gap: 16px; padding: 0 23px 15px; flex-wrap: wrap; }
+.task-bar { flex: 1 1 170px; display: flex; min-width: 130px; height: 7px; border-radius: 999px; overflow: hidden; background: rgba(120, 160, 160, .16); }
+.task-bar i { display: block; height: 100%; }
+.task-bar i.done { background: #6fc79b; }
+.task-bar i.ready { background: #e7ca90; }
+.task-bar i.todo { background: rgba(150, 178, 175, .38); }
+.task-legend { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; font-size: 10px; color: var(--w-muted); font-variant-numeric: tabular-nums; }
+.task-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.task-legend i, .legend-dot { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+.task-legend i.done, .legend-dot.done { background: #6fc79b; }
+.task-legend i.ready, .legend-dot.ready { background: #e7ca90; }
+.task-legend i.todo, .legend-dot.todo { background: transparent; border: 1px dashed rgba(160, 186, 182, .7); }
+.legend-dot.ended { background: rgba(120, 140, 138, .5); }
+/* 总览预览里的分组线：待处理 / 已完成 分开摆，状态一眼可比 */
+.dashboard-rays .task-divider { display: flex; align-items: center; gap: 10px; margin: 5px 0 -1px; font-size: 10px; color: #8fa5a0; }
+.dashboard-rays .task-divider::before, .dashboard-rays .task-divider::after { content: ''; flex: 1; height: 1px; background: rgba(130, 165, 160, .22); }
+/* 状态筛选选中时套用各自语义色，和列表里的标签对应得上 */
+.filter-chip.status-ready.on { border-color: rgba(237, 207, 146, .6); background: rgba(237, 207, 146, .14); color: var(--w-gold); }
+.filter-chip.status-done.on { border-color: rgba(113, 199, 160, .55); background: rgba(113, 199, 160, .14); color: #b7eccd; }
+.filter-chip.status-todo.on { border-color: rgba(160, 186, 182, .6); background: rgba(160, 186, 182, .1); color: #d6e2dd; }
+.filter-chip.status-ended.on { border-color: rgba(140, 160, 158, .5); background: rgba(120, 140, 138, .18); color: #a3b6b1; }
 
 /* ---------- 定时设置：每个角色一张卡 ---------- */
 .schedule-stack { display: grid; gap: 16px; max-width: 1180px; }
