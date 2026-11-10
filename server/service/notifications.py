@@ -62,15 +62,16 @@ def save_mail(root, value):
         raise ValueError('请填写 QQ 邮箱的 SMTP 授权码（不是邮箱登录密码）。')
     data = dict(enabled=value['enabled'], sender=sender, authorization_code=secret)
     # NamedTemporaryFile 默认 0600；原子替换，避免读到半份配置，也不依赖进程 umask。
+    # 注意必须先关闭临时文件再替换：Windows 不允许对打开中的文件执行 os.replace。
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root, delete=False) as stream:
         temp = Path(stream.name)
-        try:
-            json.dump(data, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.replace(temp, Path(root) / MAIL_FILE)
-        finally:
-            temp.unlink(missing_ok=True)
+        json.dump(data, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.replace(temp, Path(root) / MAIL_FILE)
+    finally:
+        temp.unlink(missing_ok=True)
     return public_mail(root)
 
 

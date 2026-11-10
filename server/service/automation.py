@@ -1,11 +1,32 @@
 """Hourly checks with a process-shared lock and durable mutation guard."""
-import fcntl
 import json
 import os
 import threading
 import store
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Windows 兼容：用 msvcrt.locking 实现与 fcntl.flock 等价的独占文件锁（仅本机单机部署场景）。
+if os.name == 'nt':
+    import errno
+    import msvcrt
+
+    LOCK_EX = 0
+    LOCK_NB = 1
+
+    def _flock(fd, flags):
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK if flags & LOCK_NB else msvcrt.LK_LOCK, 1)
+        except OSError as exc:
+            if flags & LOCK_NB:
+                raise BlockingIOError(errno.EAGAIN, 'resource busy') from exc
+            raise
+else:
+    import fcntl
+
+    LOCK_EX = fcntl.LOCK_EX
+    LOCK_NB = fcntl.LOCK_NB
+    _flock = fcntl.flock
 
 
 class OperationLock:
@@ -20,7 +41,7 @@ class OperationLock:
             return False
         try:
             self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            _flock(self.fd, LOCK_EX | (0 if blocking else LOCK_NB))
             return True
         except BlockingIOError:
             os.close(self.fd)
@@ -49,11 +70,13 @@ def save_state(path, state):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(str(temp), str(path))
-    fd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # 目录级 fsync 是 POSIX 的持久化手段；Windows 上 os.replace 已保证原子性，跳过该步骤。
+    if os.name != 'nt':
+        fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 # 一次完整执行：先查询，筛选可领取白名单任务，每次提交前后重新核对。结果未知立即停止，并用待确认记录阻止下次盲目重试。

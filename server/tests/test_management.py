@@ -159,7 +159,9 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data['has_authorization_code'])
         self.assertNotIn('abcdefghijklmnop', json.dumps(data))
-        self.assertEqual((self.base/notifications.MAIL_FILE).stat().st_mode & 0o777, 0o600)
+        # 0600 权限位是 POSIX 语义；Windows 走 NTFS ACL，st_mode 不返回 Unix 权限。
+        if os.name != 'nt':
+            self.assertEqual((self.base/notifications.MAIL_FILE).stat().st_mode & 0o777, 0o600)
         self.assertNotIn('authorization_code', self.request('/api/admin/mail')[1])
         self.assertEqual(self.request('/api/admin/mail', dict(payload, enabled=False, authorization_code=''))[0], 200)
         self.assertEqual(notifications.load_mail(self.base)['authorization_code'], 'abcdefghijklmnop')
@@ -363,7 +365,7 @@ class ManagementTests(unittest.TestCase):
     def test_migrates_legacy_schema_without_losing_sessions_or_passwords(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            with sqlite3.connect(root/'users.sqlite3') as db:
+            with closing(sqlite3.connect(root/'users.sqlite3')) as db, db:
                 db.execute('CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,password TEXT,created INTEGER,legacy INTEGER)')
                 db.execute("INSERT INTO users VALUES (1,'ark','opaque-hash',123,1)")
                 db.execute("INSERT INTO users VALUES (2,'other','other-hash',124,0)")
