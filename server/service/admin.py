@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import shutil
 
+import accounts
 import auth
 import store
 
@@ -60,7 +61,7 @@ def users(base, limit=30, offset=0, actor=None):
                 schedule_available = False
         items.append(dict(id=user['id'], username=user['username'],
                           created=datetime.fromtimestamp(user['created'], store.TZ).isoformat(),
-                          is_admin=bool(user['is_admin']), configured=(root/'config-dashboard.json').is_file(),
+                          is_admin=bool(user['is_admin']), configured=bool(accounts.list_accounts(root)),
                           delete_allowed=not bool(deletion_restriction(user, actor)),
                           delete_reason=deletion_restriction(user, actor),
                           schedule=schedule if schedule_available else None,

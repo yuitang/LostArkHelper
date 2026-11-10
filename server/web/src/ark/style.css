@@ -6,3 +6,20 @@
 .auth-brand{gap:22px}.auth-brand .official-logo{display:block;object-fit:contain;width:170px;height:66px;flex:none}.auth-brand b{border-left:1px solid #57727b;padding-left:22px}.auth-brand small{letter-spacing:.04em;font-size:11px}.official-brand{margin:-31px -16px 26px;padding:25px 20px 22px;background:#123e4c;display:flex;flex-direction:column;align-items:flex-start;gap:13px}.official-brand>img{display:block;width:170px;height:66px;object-fit:contain}.official-brand strong{color:#fff;font-size:14px}.official-brand small{color:#c1d5d7;font-size:10px;letter-spacing:.05em}@media(min-width:701px) and (max-width:950px){.official-brand{margin:-25px -9px 24px;padding:20px 5px;align-items:center}.official-brand>img{width:60px;height:auto}.official-brand>div{display:none}}@media(max-width:700px){.auth-brand{gap:15px}.auth-brand .official-logo{width:136px;height:auto}.auth-brand b{font-size:16px;padding-left:15px}.auth-brand small{font-size:10px}.auth-story{padding:21px 24px}.official-brand{display:none}}
 /* User-approved wordmark; compact branding without a secondary caption. */
 .official-brand{background:#050605;margin:-31px -16px 22px;padding:17px 20px;min-height:90px;justify-content:center;gap:0}.official-brand>img{width:140px;height:auto;max-width:100%;display:block}.auth-brand{background:#050605;padding:10px 14px;border-radius:6px}.auth-brand .official-logo{width:170px;height:auto}@media(min-width:701px) and (max-width:950px){.official-brand{margin:-25px -9px 22px;padding:16px 5px;min-height:60px}.official-brand>img{width:60px;height:auto}}@media(max-width:700px){.official-brand{display:none}.auth-brand{padding:8px 12px}.auth-brand .official-logo{width:145px;height:auto}}
+
+/* 多账号：每个游戏角色一行，可切换当前账号或解绑 */
+.account-list{border-top:1px solid #f0f3f2;margin:0 23px}
+.account-row{display:flex;align-items:center;gap:13px;padding:16px 0;border-bottom:1px solid #f4f7f6}
+.account-row.current{background:#f7fbf9;margin:0 -12px;padding:16px 12px;border-radius:9px}
+.account-main{flex:1;min-width:0}
+.account-main h3{margin:0;font-size:13px;color:#3c555b;display:flex;align-items:center;gap:8px}
+.account-main p{margin:6px 0 0;font-size:11px;color:#9dacac}
+.current-tag{font-size:10px;font-weight:400;color:#3f8b76;background:#e9f5ef;border-radius:4px;padding:3px 7px}
+.account-actions{display:flex;align-items:center;gap:8px;flex:none}
+.unbind{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 11px;border:1px solid #eddfdc;border-radius:8px;background:#fff;color:#a4685f;font-size:11px}
+.unbind:hover:not(:disabled){background:#fdf4f2;border-color:#e4cdc8}
+.account-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 23px 0}
+.account-tip{font-size:11px;color:#a2b1b0}
+.account-error{display:flex;align-items:center;gap:8px;margin:14px 23px 0;padding:11px 13px;border-radius:8px;background:#fdf4f3;color:#a4605a;font-size:11px;border:1px solid #f0dcda}
+.account-select{height:30px;border:1px solid #dfe7e5;border-radius:7px;background:#fff;color:#5d7a76;font-size:11px;padding:0 7px;max-width:130px}
+@media(max-width:700px){.account-row{flex-wrap:wrap}.account-actions{width:100%;justify-content:flex-end}}

@@ -8,9 +8,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlsplit, parse_qs
-from automation import OperationLock, run, save_state, error_info, finish_run
+from automation import OperationLock, run, error_info, finish_run
 import store
 import auth
+import accounts
 import helper
 import import_link as importer
 import admin
@@ -22,31 +23,33 @@ PORT = int(os.environ.get('ARK_PORT', '18745'))
 PUBLIC_ORIGIN = os.environ.get('ARK_PUBLIC_ORIGIN', 'https://lostarkhelper.dpdns.org').rstrip('/')
 COOKIE = 'ark_session'
 
-# 读取当前账号的游戏凭据；只供后端内部调用，不能把返回值直接输出到网页或日志。
-def read_config(root):
-    obj = json.loads((root / 'config-dashboard.json').read_text(encoding='utf-8'))
-    if not isinstance(obj, dict) or not isinstance(obj.get('form'), dict) or not isinstance(obj.get('cookie'), str):
-        raise ValueError('invalid')
-    return obj
+# 读取指定角色的游戏凭据；只供后端内部调用，不能把返回值直接输出到网页或日志。
+def read_config(root, account_id):
+    return accounts.read_config(root, account_id)
 
 # 向官方接口查询签到和任务，向网页仅返回展示所需的字段；此函数不提交签到或领奖。
-def status(root):
-    if not (root / 'config-dashboard.json').exists():
-        return {'configured': False, 'source': None}
+# account_id 为空且只有一个账号时自动选中该账号；多账号必须显式指定。
+def status(root, account_id=None):
+    items = accounts.list_accounts(root)
+    if not items:
+        return {'configured': False, 'source': None, 'accounts': []}
     try:
-        config = read_config(root)
+        account_id = accounts.resolve(root, account_id)
+    except accounts.AccountError as exc:
+        return {'configured': False, 'source': None, 'accounts': items, 'error': str(exc)}
+    current = next(item for item in items if item['id'] == account_id)
+    base = {'configured': True, 'source': current['role'], 'account': current, 'accounts': items}
+    try:
+        config = read_config(root, account_id)
         signed = helper.sign_status(config)
         tasks = helper.tasks(config)
         cleaned = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100],
                     'type': t['type'], 'status': t['status'], 'exp': t.get('exp')} for t in tasks]
-        return {'configured': True, 'source': '我的游戏账号', 'signed': signed, 'tasks': cleaned,
-                'time': datetime.now(store.TZ).strftime('%H:%M')}
+        return dict(base, signed=signed, tasks=cleaned, time=datetime.now(store.TZ).strftime('%H:%M'))
     except helper.ApiError as exc:
-        return {'configured': True, 'source': '我的游戏账号',
-                'error': str(exc), 'needs_token_update': exc.kind in ('auth_invalid', 'auth_mismatch')}
+        return dict(base, error=str(exc), needs_token_update=exc.kind in ('auth_invalid', 'auth_mismatch'))
     except Exception:
-        return {'configured': True, 'source': '我的游戏账号',
-                'error': '查询失败，请更新登录凭据或检查活动是否有效。'}
+        return dict(base, error='查询失败，请更新登录凭据或检查活动是否有效。')
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -144,8 +147,12 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         return self.reply(400, {'error': '分页参数无效'})
                     return self.reply(200, store.history(root, before))
+                if path == '/api/accounts':
+                    return self.reply(200, {'accounts': accounts.list_accounts(root)})
                 if path == '/api/status':
-                    return self.reply(200, status(root))
+                    query = parse_qs(urlsplit(self.path).query)
+                    account_id = (query.get('account', [''])[0] or '').strip() or None
+                    return self.reply(200, status(root, account_id))
                 return self.reply(404, {'error': 'not found'})
             finally:
                 lock.release()
@@ -262,19 +269,19 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     return self.reply(400, {'error': '时间设置无效，请检查分钟及 HH:MM 格式。'})
                 return self.reply(200, dict(value, timezone='Asia/Shanghai', next_run=store.next_run(value), message='我的定时设置已保存。'))
-            if path == '/api/import':
+            if path in ('/api/import', '/api/accounts/import'):
                 if not isinstance(obj.get('url'), str):
                     return self.reply(400, {'error': '请填写分享链接。'})
-                file = root / 'config-dashboard.json'
-                configured = file.exists()
-                if configured and obj.get('replace') is not True:
-                    return self.reply(409, {'error': '已有 token，请勾选确认更新后再提交。'})
                 try:
                     config, info = importer.parse_link(obj['url'])
-                except ValueError:
+                    account_id = accounts.config_id(config)
+                except (ValueError, accounts.AccountError):
                     return self.reply(400, {'error': '分享链接无效，请从官方 App 复制支持的活动链接。'})
-                if file.exists():
-                    old = read_config(root)
+                existing = accounts.exists(root, account_id)
+                if existing and obj.get('replace') is not True:
+                    return self.reply(409, {'error': '该角色已绑定，请勾选确认更新后再提交；如需换角色请新增账号。'})
+                if existing:
+                    old = read_config(root, account_id)
                     if any(str(old['form'].get(k)) != str(config['form'].get(k)) for k in ('user_id', 'openid', 'sRoleld')):
                         return self.reply(409, {'error': '仅支持更新同一游戏账号和角色的 token，不能在此切换账号。'})
                 # 不能把过期凭据保存成“更新成功”，也不能据此清除待确认记录。
@@ -283,33 +290,55 @@ class Handler(BaseHTTPRequestHandler):
                 except helper.ApiError as exc:
                     return self.reply(400 if exc.kind in ('auth_invalid', 'auth_mismatch') else 503,
                                       {'error': str(exc), 'needs_token_update': exc.kind in ('auth_invalid', 'auth_mismatch')})
-                save_state(file, config)
+                # 首个账号才初始化定时计划；已有其他账号时只新增，不改动已有计划。
+                first = not accounts.list_accounts(root)
+                saved_id, created = accounts.save(root, config, info,
+                                                  added=datetime.now(store.TZ).isoformat(timespec='seconds'))
                 try:
-                    initialized = store.token_imported(root, first_import=not configured)
+                    initialized = store.token_imported(root, first_import=first)
                 except Exception:
-                    # 首次计划落盘失败时撤回本次首次配置，重试仍可完整初始化。
-                    if not configured:
-                        file.unlink(missing_ok=True)
+                    # 首次计划落盘失败时撤回本次新增，重试仍可完整初始化。
+                    if created:
+                        accounts.delete(root, saved_id)
                     raise
                 # 已持有该账号的操作锁，且凭据保存成功；允许用新凭据重新查询后执行。
                 # 校验失败、身份不符或写入失败时不会执行到这里，原待确认记录仍保留。
-                pending = root / 'pending-operation.json'
+                pending = accounts.pending_file(root, saved_id)
                 recovered = pending.exists()
                 pending.unlink(missing_ok=True)
                 names = ' / '.join(str(info.get(k) or '未提供')[:100] for k in ('area', 'server', 'role'))
                 schedule = store.settings(root)
-                plan = '。已自动开启每小时第 {} 分钟执行，可在定时设置修改。'.format(schedule['minute']) if initialized else '。定时计划保持原设置。'
-                return self.reply(200, {'message': '我的 token 已保存：' + names + plan + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
-                                        'pending_cleared': recovered, 'schedule_initialized': initialized})
+                plan = '。已自动开启每小时第 {} 分钟执行，可在定时设置修改。'.format(schedule['minute']) if initialized else ''
+                verb = '角色已添加' if created else '角色 token 已更新'
+                return self.reply(200, {'message': verb + '：' + names + plan + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
+                                        'account': next(item for item in accounts.list_accounts(root) if item['id'] == saved_id),
+                                        'created': created, 'pending_cleared': recovered,
+                                        'schedule_initialized': initialized})
+            if path == '/api/accounts/delete':
+                account_id = obj.get('id')
+                if not isinstance(account_id, str) or not account_id.strip():
+                    return self.reply(400, {'error': '请选择要解绑的账号。'})
+                try:
+                    removed = accounts.delete(root, account_id.strip())
+                except accounts.AccountError as exc:
+                    return self.reply(404, {'error': str(exc)})
+                remaining = accounts.list_accounts(root)
+                return self.reply(200, {'message': '已解绑该角色：服务器上的登录凭据和待确认记录已删除，运行历史保留。',
+                                        'id': removed, 'accounts': remaining})
             if path not in ('/api/sign', '/api/claim', '/api/run'):
                 return self.reply(404, {'error': 'not found'})
-            if not (root / 'config-dashboard.json').exists():
-                return self.reply(400, {'error': '请先导入自己的游戏账号。'})
-            report = {'trigger': 'manual'}
+            requested = obj.get('account')
+            try:
+                account_id = accounts.resolve(root, requested.strip() if isinstance(requested, str) and requested.strip() else None)
+                config = read_config(root, account_id)
+            except accounts.AccountError as exc:
+                return self.reply(400, {'error': str(exc)})
+            current = next((item for item in accounts.list_accounts(root) if item['id'] == account_id), {'id': account_id})
+            report = {'trigger': 'manual', 'account': current}
             run_id = store.begin(root, None)
             report['run_id'] = run_id
             try:
-                code = run(helper, read_config(root), root, report=report,
+                code = run(helper, config, root, report=report, state_dir=accounts.account_dir(root, account_id),
                            allow_sign=path in ('/api/sign', '/api/run'), allow_claim=path in ('/api/claim', '/api/run'))
             except Exception as exc:
                 report.setdefault('errors', []).append(error_info(exc, report.get('stage', '手动操作')))

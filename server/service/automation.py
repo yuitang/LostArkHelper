@@ -80,7 +80,8 @@ def save_state(path, state):
 
 
 # 一次完整执行：先查询，筛选可领取白名单任务，每次提交前后重新核对。结果未知立即停止，并用待确认记录阻止下次盲目重试。
-def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True):
+# state_dir 指定待确认记录所在目录：多账号时每个角色各自一份，互不影响。
+def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True, state_dir=None):
     report = report if report is not None else {}
     report.update(sign="not_checked", claimed=[], skipped=[], message="")
     report['errors'] = []
@@ -94,7 +95,7 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
     unknown = sum(t['status'] == 1 and t['id'] not in helper.VERIFIED for t in items)
     print('CHECK signed={} claimable={} skipped_unsupported={}'.format(signed, candidates, unknown), flush=True)
     report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100]} for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
-    guard = Path(root) / 'pending-operation.json'
+    guard = Path(state_dir or root) / 'pending-operation.json'
     if guard.exists():
         pending = json.loads(guard.read_text(encoding='utf-8'))
         action = pending.get('action')
@@ -187,7 +188,13 @@ def finish_run(root, run_id, report, outcome, notify=None):
 
 
 def execute_user(root, helper, check_only=False, run_now=False, notify=None, account=None):
+    """账号级调度入口：一次持锁，逐个游戏角色执行。
+
+    每个角色独立保存凭据、待确认记录和运行记录行；某个角色失败不影响其他角色。
+    时间槽按「分钟#角色ID」区分，避免同一次计划里多个角色互相去重覆盖。
+    """
     import auth
+    import accounts
     lock = auth.operation_lock(*account) if account else OperationLock(root)
     if not lock.acquire():
         if account:
@@ -201,8 +208,6 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
                            (at.strftime('%Y-%m-%dT%H:%M'), at.isoformat(), at.isoformat(), json.dumps({'message':'其他操作正在执行，本次已跳过，避免重复提交。'})))
         print('SKIP: another operation is running.', flush=True)
         return 0
-    run_id = None
-    report = {'check_only': check_only, 'trigger': 'scheduled_now' if run_now else 'scheduled'}
     try:
         if account and (not auth.user_exists(*account) or not root.is_dir()):
             return 0
@@ -210,29 +215,48 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
         schedule = store.settings(root)
         if not check_only and (not schedule['enabled'] or (not run_now and not store.due(schedule, at))):
             return 0
-        config_path = root / 'config-dashboard.json'
-        if check_only and not config_path.exists():
+        items = accounts.list_accounts(root)
+        if not items:
+            if check_only:
+                return 0
+            # 没有绑定角色时每小时只记录一次跳过，避免重复刷历史。
+            run_id = store.begin(root, at.strftime('%Y-%m-%dT%H:%M'))
+            if run_id is not None:
+                store.update(root, run_id, {'check_only': False, 'trigger': 'scheduled',
+                                            'message': '尚未绑定游戏账号，已跳过。'}, 'skipped')
             return 0
-        slot = at.strftime('%Y-%m-%dT%H:%M') if not check_only and not run_now else None
-        run_id = store.begin(root, slot)
-        if run_id is None:
-            return 0
-        report['run_id'] = run_id
-        if not config_path.exists():
-            report['message'] = '未导入面板账号，已跳过。'
-            store.update(root, run_id, report, 'skipped')
-            return 0
-        config = json.loads(config_path.read_text(encoding='utf-8'))
-        code = run(helper, config, root, check_only, report)
-        finish_run(root, run_id, report, 'success' if code == 0 else 'error', notify)
-        return code
+        codes = []
+        for item in items:
+            if check_only and not accounts.exists(root, item['id']):
+                continue
+            report = {'check_only': check_only, 'trigger': 'scheduled_now' if run_now else 'scheduled',
+                      'account': item}
+            # 同一分钟内每个角色各占一个时间槽；手动立刻执行不写槽（允许重复手动触发）。
+            slot = at.strftime('%Y-%m-%dT%H:%M') + '#' + item['id'] if not check_only and not run_now else None
+            run_id = store.begin(root, slot)
+            if run_id is None:
+                continue
+            report['run_id'] = run_id
+            try:
+                config = accounts.read_config(root, item['id'])
+                if not isinstance(config, dict):
+                    raise ValueError('账号凭据格式无效')
+                # 该角色的待确认记录放在自己的目录里，不同角色之间不会互相阻塞。
+                code = run(helper, config, root, check_only, report,
+                           state_dir=accounts.account_dir(root, item['id']))
+            except Exception as exc:
+                error = error_info(exc, report.get('stage', '读取账号配置'))
+                report.setdefault('errors', []).append(error)
+                report['message'] = '；'.join(e['summary'] for e in report['errors'])
+                finish_run(root, run_id, report, 'error', notify)
+                print('ERROR: query/write failed for account {}; see private execution history.'.format(item['id']), flush=True)
+                codes.append(1)
+                continue
+            finish_run(root, run_id, report, 'success' if code == 0 else 'error', notify)
+            codes.append(code)
+        return 1 if any(codes) else 0
     except Exception as exc:
-        error = error_info(exc, report.get('stage', '读取账号配置'))
-        report.setdefault('errors', []).append(error)
-        report['message'] = '；'.join(e['summary'] for e in report['errors'])
-        if run_id:
-            finish_run(root, run_id, report, 'error', notify)
-        print('ERROR: query/write failed; see private execution history. No immediate retry.', flush=True)
+        print('ERROR: scheduled run failed: {}'.format(type(exc).__name__), flush=True)
         return 1
     finally:
         lock.release()

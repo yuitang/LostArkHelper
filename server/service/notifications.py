@@ -101,9 +101,12 @@ def build_message(sender, recipient, user, run_id, report):
     message = EmailMessage()
     message['From'], message['To'] = sender, recipient
     message['Subject'] = '命运方舟助手：任务执行异常'
-    message.set_content('账号：{}\n执行记录：#{}\n通知时间：{}（北京时间）\n\n{}\n\n'
+    account = report.get('account') if isinstance(report.get('account'), dict) else {}
+    role = str(account.get('role') or account.get('id') or '')[:100]
+    message.set_content('账号：{}\n角色：{}\n执行记录：#{}\n通知时间：{}（北京时间）\n\n{}\n\n'
                         '请登录工作台查看详情。邮件不包含游戏登录凭据。\n'.format(
-                            user['username'], int(run_id), store.now().strftime('%Y-%m-%d %H:%M:%S'), reason))
+                            user['username'], role or '未提供', int(run_id),
+                            store.now().strftime('%Y-%m-%d %H:%M:%S'), reason))
     return message
 
 
