@@ -139,15 +139,24 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, dict(auth.notification_preferences(ROOT, user),
                                               mail_ready=notifications.public_mail(ROOT)['ready']))
                 if path == '/api/schedule':
-                    value = store.settings(root)
-                    return self.reply(200, dict(value, timezone='Asia/Shanghai', next_run=store.next_run(value)))
+                    items = accounts.list_accounts(root)
+                    plans = store.account_plans(root, [item['id'] for item in items])
+                    return self.reply(200, {
+                        'timezone': 'Asia/Shanghai',
+                        'default_plan': store.settings(root),
+                        'accounts': [dict(item, plan=plans[item['id']], next_run=store.next_run(plans[item['id']]))
+                                     for item in items]})
                 if path == '/api/history':
+                    query = parse_qs(urlsplit(self.path).query)
                     try:
-                        before = int(parse_qs(urlsplit(self.path).query).get('before', ['0'])[0])
+                        before = int(query.get('before', ['0'])[0])
                         if before < 0: raise ValueError()
                     except ValueError:
                         return self.reply(400, {'error': '分页参数无效'})
-                    return self.reply(200, store.history(root, before))
+                    account_id = (query.get('account', [''])[0] or '').strip() or None
+                    if account_id and not accounts.valid_id(account_id):
+                        return self.reply(400, {'error': '账号参数无效。'})
+                    return self.reply(200, store.history(root, before, account_id))
                 if path == '/api/accounts':
                     return self.reply(200, {'accounts': accounts.list_accounts(root)})
                 if path == '/api/status':
@@ -265,11 +274,18 @@ class Handler(BaseHTTPRequestHandler):
                 auth.notification_preferences(ROOT, user, value)
                 return self.reply(200, dict(value, message='异常邮件提醒设置已保存。'))
             if path == '/api/schedule':
+                account_id = obj.pop('account', None) if isinstance(obj, dict) else None
                 try:
-                    value = store.settings(root, obj)
+                    account_id = accounts.resolve(root, account_id.strip() if isinstance(account_id, str) and account_id.strip() else None)
+                    plan = store.account_settings(root, account_id, obj)
+                except accounts.AccountError as exc:
+                    return self.reply(400, {'error': str(exc)})
                 except ValueError:
                     return self.reply(400, {'error': '时间设置无效，请检查分钟及 HH:MM 格式。'})
-                return self.reply(200, dict(value, timezone='Asia/Shanghai', next_run=store.next_run(value), message='我的定时设置已保存。'))
+                current = next((item for item in accounts.list_accounts(root) if item['id'] == account_id), {'id': account_id})
+                return self.reply(200, dict(plan, timezone='Asia/Shanghai', account=current,
+                                            next_run=store.next_run(plan),
+                                            message='「{}」的定时设置已保存。'.format(current.get('role') or '当前角色')))
             if path in ('/api/import', '/api/accounts/import'):
                 if not isinstance(obj.get('url'), str):
                     return self.reply(400, {'error': '请填写分享链接。'})
@@ -296,7 +312,7 @@ class Handler(BaseHTTPRequestHandler):
                 saved_id, created = accounts.save(root, config, info,
                                                   added=datetime.now(store.TZ).isoformat(timespec='seconds'))
                 try:
-                    initialized = store.token_imported(root, first_import=first)
+                    initialized = store.token_imported(root, saved_id, first_import=first)
                 except Exception:
                     # 首次计划落盘失败时撤回本次新增，重试仍可完整初始化。
                     if created:
@@ -308,10 +324,10 @@ class Handler(BaseHTTPRequestHandler):
                 recovered = pending.exists()
                 pending.unlink(missing_ok=True)
                 names = ' / '.join(str(info.get(k) or '未提供')[:100] for k in ('area', 'server', 'role'))
-                schedule = store.settings(root)
-                plan = '。已自动开启每小时第 {} 分钟执行，可在定时设置修改。'.format(schedule['minute']) if initialized else ''
+                current_plan = store.account_settings(root, saved_id)
+                plan_note = '。该角色已启用每小时第 {} 分钟执行，可在定时设置单独调整。'.format(current_plan['minute']) if initialized else ''
                 verb = '角色已添加' if created else '角色 token 已更新'
-                return self.reply(200, {'message': verb + '：' + names + plan + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
+                return self.reply(200, {'message': verb + '：' + names + plan_note + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
                                         'account': next(item for item in accounts.list_accounts(root) if item['id'] == saved_id),
                                         'created': created, 'pending_cleared': recovered,
                                         'schedule_initialized': initialized})
@@ -323,6 +339,8 @@ class Handler(BaseHTTPRequestHandler):
                     removed = accounts.delete(root, account_id.strip())
                 except accounts.AccountError as exc:
                     return self.reply(404, {'error': str(exc)})
+                # 该角色的独立计划一并清理，运行历史保留用于审计。
+                store.clear_account_settings(root, removed)
                 remaining = accounts.list_accounts(root)
                 return self.reply(200, {'message': '已解绑该角色：服务器上的登录凭据和待确认记录已删除，运行历史保留。',
                                         'id': removed, 'accounts': remaining})

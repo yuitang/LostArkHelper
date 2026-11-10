@@ -202,7 +202,8 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
             print('SKIP: another account operation is running.', flush=True)
             return 0
         at = store.now()
-        if store.due(store.settings(root), at):
+        plans = store.account_plans(root, [item['id'] for item in accounts.list_accounts(root)])
+        if any(store.due(plan, at) for plan in plans.values()):
             with store.connect(root) as db:
                 db.execute("INSERT OR IGNORE INTO runs(slot,started,finished,outcome,details) VALUES (?,?,?,'skipped',?)",
                            (at.strftime('%Y-%m-%dT%H:%M'), at.isoformat(), at.isoformat(), json.dumps({'message':'其他操作正在执行，本次已跳过，避免重复提交。'})))
@@ -212,21 +213,24 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
         if account and (not auth.user_exists(*account) or not root.is_dir()):
             return 0
         at = store.now()
-        schedule = store.settings(root)
-        if not check_only and (not schedule['enabled'] or (not run_now and not store.due(schedule, at))):
-            return 0
         items = accounts.list_accounts(root)
         if not items:
             if check_only:
                 return 0
-            # 没有绑定角色时每小时只记录一次跳过，避免重复刷历史。
-            run_id = store.begin(root, at.strftime('%Y-%m-%dT%H:%M'))
-            if run_id is not None:
-                store.update(root, run_id, {'check_only': False, 'trigger': 'scheduled',
-                                            'message': '尚未绑定游戏账号，已跳过。'}, 'skipped')
+            # 没有绑定角色时按用户默认计划每小时只记录一次跳过，避免重复刷历史。
+            if store.due(store.settings(root), at):
+                run_id = store.begin(root, at.strftime('%Y-%m-%dT%H:%M'))
+                if run_id is not None:
+                    store.update(root, run_id, {'check_only': False, 'trigger': 'scheduled',
+                                                'message': '尚未绑定游戏账号，已跳过。'}, 'skipped')
             return 0
+        # 每个角色有独立的开关与执行时间，逐个判断是否到期；某个账号暂停不影响其他账号。
+        plans = store.account_plans(root, [item['id'] for item in items])
         codes = []
         for item in items:
+            plan = plans[item['id']]
+            if not check_only and (not plan['enabled'] or (not run_now and not store.due(plan, at))):
+                continue
             if check_only and not accounts.exists(root, item['id']):
                 continue
             report = {'check_only': check_only, 'trigger': 'scheduled_now' if run_now else 'scheduled',

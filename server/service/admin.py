@@ -51,6 +51,8 @@ def users(base, limit=30, offset=0, actor=None):
         schedule = dict(store.DEFAULT)
         file = root / 'automation.sqlite3'
         schedule_available = True
+        bound = []
+        enabled_plans = 0
         if file.exists():
             try:
                 with closing(sqlite3.connect(file.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as db:
@@ -59,9 +61,18 @@ def users(base, limit=30, offset=0, actor=None):
                     schedule = store.validate(json.loads(row[0]))
             except (sqlite3.Error, OSError, ValueError, TypeError):
                 schedule_available = False
+        if root.is_dir():
+            bound = accounts.list_accounts(root)
+            if file.exists():
+                try:
+                    plans = store.account_plans(root, [item['id'] for item in bound])
+                    enabled_plans = sum(1 for plan in plans.values() if plan['enabled'])
+                except (sqlite3.Error, OSError, ValueError):
+                    enabled_plans = 0
         items.append(dict(id=user['id'], username=user['username'],
                           created=datetime.fromtimestamp(user['created'], store.TZ).isoformat(),
-                          is_admin=bool(user['is_admin']), configured=bool(accounts.list_accounts(root)),
+                          is_admin=bool(user['is_admin']), configured=bool(bound),
+                          game_accounts=bound, enabled_plans=enabled_plans,
                           delete_allowed=not bool(deletion_restriction(user, actor)),
                           delete_reason=deletion_restriction(user, actor),
                           schedule=schedule if schedule_available else None,

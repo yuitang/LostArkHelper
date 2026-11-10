@@ -58,15 +58,65 @@ def settings(root, value=None):
     return json.loads(row['value']) if row else dict(DEFAULT)
 
 
-def token_imported(root, first_import):
+# 每个游戏角色有独立计划，保存在 account_state 的 plan:<角色ID> 键下。
+# 未单独保存过的角色回落到用户默认计划，旧版本升级后行为不变。
+def account_settings(root, account_id, value=None):
+    key = 'plan:' + str(account_id)
+    with connect(root) as db:
+        if value is not None:
+            value = validate(value)
+            db.execute('INSERT OR REPLACE INTO account_state VALUES (?,?)', (key, json.dumps(value)))
+        row = db.execute('SELECT value FROM account_state WHERE key=?', (key,)).fetchone()
+    if row:
+        try:
+            return validate(json.loads(row['value']))
+        except (ValueError, TypeError):
+            return settings(root)
+    return settings(root)
+
+
+def clear_account_settings(root, account_id):
+    """解绑角色后同步删除它的计划，避免角色 ID 复用时继承旧设置。"""
+    with connect(root) as db:
+        db.execute('DELETE FROM account_state WHERE key=?', ('plan:' + str(account_id),))
+
+
+# 一次读出全部角色的计划，避免页面加载时对每个账号各开一次数据库连接。
+def account_plans(root, account_ids):
+    with connect(root) as db:
+        rows = db.execute("SELECT key,value FROM account_state WHERE key LIKE 'plan:%'").fetchall()
+    stored = {}
+    for row in rows:
+        try:
+            stored[row['key'][5:]] = validate(json.loads(row['value']))
+        except (ValueError, TypeError):
+            continue
+    default = settings(root)
+    return {str(item): stored.get(str(item), default) for item in account_ids}
+
+
+def token_imported(root, account_id, first_import):
     """首次成功导入选择一次随机分钟；更新旧凭据不覆盖已有计划。调用方持账号锁。"""
+    key = 'plan:' + str(account_id)
     with connect(root) as db:
         db.execute('BEGIN IMMEDIATE')
-        initialized = db.execute("SELECT 1 FROM account_state WHERE key='token_imported'").fetchone()
-        changed = first_import and not initialized
+        row = db.execute('SELECT value FROM settings WHERE id=1').fetchone()
+        default = json.loads(row['value']) if row else dict(DEFAULT)
+        has_plan = db.execute('SELECT 1 FROM account_state WHERE key=?', (key,)).fetchone()
+        changed = first_import and not has_plan
         if changed:
-            value = dict(DEFAULT, enabled=True, minute=secrets.randbelow(60))
-            db.execute('INSERT OR REPLACE INTO settings VALUES (1,?)', (json.dumps(value),))
+            # 每个角色分配不同的随机分钟，多账号不会挤在同一分钟请求官方接口。
+            value = dict(default, enabled=True, minute=secrets.randbelow(60))
+            if not row or not json.loads(row['value']).get('enabled'):
+                db.execute('INSERT OR REPLACE INTO settings VALUES (1,?)', (json.dumps(value),))
+            else:
+                value = dict(default, enabled=True)
+        elif not has_plan:
+            value = dict(default, enabled=first_import or default['enabled'])
+        else:
+            value = None
+        if value is not None:
+            db.execute('INSERT OR REPLACE INTO account_state VALUES (?,?)', (key, json.dumps(value)))
         db.execute("INSERT OR IGNORE INTO account_state VALUES ('token_imported','1')")
     return changed
 
@@ -89,12 +139,16 @@ def due(value, at):
                                  else at.strftime('%H:%M') in value['times'])
 
 # 按记录 ID 倒序分页，每页最多 30 条，不返回游戏凭据。
-def history(root, before=None):
+# account_id 用于按游戏角色筛选；记录里的角色 ID 存在 details.account.id。
+def history(root, before=None, account_id=None):
+    sql = ('SELECT runs.*,mail_deliveries.state AS email_status,mail_deliveries.reason AS email_reason '
+           'FROM runs LEFT JOIN mail_deliveries ON runs.id=mail_deliveries.run_id WHERE runs.id < ?')
+    params = [before or 9223372036854775807]
+    if account_id:
+        sql += " AND json_extract(runs.details,'$.account.id') = ?"
+        params.append(str(account_id))
     with connect(root) as db:
-        rows = db.execute('SELECT runs.*,mail_deliveries.state AS email_status,mail_deliveries.reason AS email_reason '
-                          'FROM runs LEFT JOIN mail_deliveries ON runs.id=mail_deliveries.run_id '
-                          'WHERE runs.id < ? ORDER BY runs.id DESC LIMIT 31',
-                          (before or 9223372036854775807,)).fetchall()
+        rows = db.execute(sql + ' ORDER BY runs.id DESC LIMIT 31', params).fetchall()
     items = [dict(row, details=json.loads(row['details'])) for row in rows[:30]]
     return {'items': items, 'next': items[-1]['id'] if len(rows) > 30 else None}
 

@@ -13,8 +13,10 @@
 - 存储：`<用户目录>/accounts/<角色ID>/config-dashboard.json` 保存凭据，同目录下的 `pending-operation.json` 记录该角色的待确认操作；`<用户目录>/accounts.json` 只存角色名/区服等展示信息，不含 token。
 - 接口：`GET /api/accounts` 列出已绑定角色；`POST /api/accounts/import` 添加或更新（同一角色需 `replace:true` 才允许更新）；`POST /api/accounts/delete` 解绑（删除凭据与待确认记录，保留运行历史）；`GET /api/status?account=<角色ID>` 查询指定角色，有多个角色时必须显式指定。
 - 执行：定时任务逐个角色执行，时间槽为「分钟#角色ID」，各角色互不阻塞；某个角色的待确认记录只阻止它自己。
+- 计划：每个角色有独立开关、频率和执行时间（存放在该用户 SQLite 的 `account_state` 表 `plan:<角色ID>`）。`GET /api/schedule` 返回 `accounts[]`（每个角色的 `plan` 与 `next_run`）与 `default_plan`；`POST /api/schedule` 必须带 `account`，只更新该角色。没有单独保存过的角色沿用用户默认计划，因此旧数据升级后行为不变；首次导入的新角色自动启用并分配随机分钟。
+- 历史：`GET /api/history?account=<角色ID>` 按角色筛选，分页与统计规则不变。
 - 兼容：旧版放在用户目录根下的 `config-dashboard.json` / `pending-operation.json` 会在首次访问时自动迁移到 `accounts/<角色ID>/`，无需手工迁移。
-- 前端：账号管理页支持列出、切换、添加、解绑；概览页在绑定多个角色时提供账号下拉切换，运行记录会标注所属角色。
+- 前端：账号管理页支持列出、切换、添加、解绑；总览与活动中心提供角色横条切换，顶栏有账号切换器；定时设置按角色一张卡（可单独保存或同步到其他角色）；运行记录可按角色与结果筛选，并标注所属角色；管理员用户列表显示每个用户的角色数与启用计划数。
 
 ## 部署
 

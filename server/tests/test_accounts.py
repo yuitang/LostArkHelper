@@ -191,6 +191,58 @@ class AccountsTests(unittest.TestCase):
         with store.connect(self.root) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM runs').fetchone()[0], 2)
 
+    def test_each_role_has_its_own_plan_and_paused_role_is_skipped(self):
+        write_account(self.root)
+        write_account(self.root, link=sample_link(roleId='888', roleName='第二角色'), role_id='888')
+        minute = store.now().minute
+        store.account_settings(self.root, '456', dict(store.DEFAULT, enabled=True, minute=minute))
+        store.account_settings(self.root, '888', dict(store.DEFAULT, enabled=False, minute=minute))
+        self.assertEqual(automation.execute_user(self.root, FakeGame), 0)
+        runs = store.history(self.root)['items']
+        # 只有开启的角色执行；暂停的角色不写运行记录。
+        self.assertEqual([item['details']['account']['id'] for item in runs], ['456'])
+        # 再开启 888，同一分钟也能执行自己的时间槽。
+        store.account_settings(self.root, '888', dict(store.DEFAULT, enabled=True, minute=minute))
+        self.assertEqual(automation.execute_user(self.root, FakeGame), 0)
+        self.assertEqual(sorted(item['details']['account']['id'] for item in store.history(self.root)['items']),
+                         ['456', '888'])
+
+    def test_schedule_api_reads_and_writes_per_account(self):
+        write_account(self.root)
+        write_account(self.root, link=sample_link(roleId='888', roleName='第二角色'), role_id='888')
+        status, data = self.request('/api/schedule')
+        self.assertEqual(status, 200)
+        self.assertEqual([item['id'] for item in data['accounts']], ['456', '888'])
+        self.assertIn('plan', data['accounts'][0])
+        # 多账号时保存计划必须指定角色，避免改到别的号。
+        self.assertEqual(self.request('/api/schedule', dict(store.DEFAULT, enabled=True))[0], 400)
+        custom = dict(store.DEFAULT, enabled=True, mode='daily', times=['08:15', '20:30'])
+        status, data = self.request('/api/schedule', dict(custom, account='888'))
+        self.assertEqual(status, 200)
+        self.assertEqual(data['account']['id'], '888')
+        self.assertIn('888', data['message'])
+        self.assertEqual(store.account_settings(self.root, '888'), custom)
+        self.assertFalse(store.account_settings(self.root, '456')['enabled'])
+        # 写入的参数仍严格校验。
+        self.assertEqual(self.request('/api/schedule', dict(custom, account='888', extra=1))[0], 400)
+        self.assertEqual(self.request('/api/schedule', dict(dict(store.DEFAULT, minute=99), account='888'))[0], 400)
+
+    def test_history_filters_by_role_and_unbind_keeps_history(self):
+        write_account(self.root)
+        write_account(self.root, link=sample_link(roleId='888', roleName='第二角色'), role_id='888')
+        for role in ('456', '888', '456'):
+            run_id = store.begin(self.root, None)
+            store.update(self.root, run_id, dict(trigger='manual', account={'id': role, 'role': role}), 'success')
+        self.assertEqual(len(store.history(self.root)['items']), 3)
+        self.assertEqual(len(self.request('/api/history?account=456')[1]['items']), 2)
+        self.assertEqual(len(self.request('/api/history?account=888')[1]['items']), 1)
+        self.assertEqual(self.request('/api/history?account=../etc')[0], 400)
+        # 解绑只清理该角色的计划，历史记录继续保留可查。
+        store.account_settings(self.root, '456', dict(store.DEFAULT, enabled=True, minute=3))
+        self.assertEqual(self.request('/api/accounts/delete', dict(id='456'))[0], 200)
+        self.assertEqual(store.account_settings(self.root, '456')['minute'], 0)
+        self.assertEqual(len(self.request('/api/history?account=456')[1]['items']), 2)
+
 
 if __name__ == '__main__':
     unittest.main()
