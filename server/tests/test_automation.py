@@ -56,13 +56,15 @@ class AutomationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # 拒绝计数是进程级的状态，测试之间必须清空，否则会互相屏蔽任务。
+        automation.REJECTED.clear()
 
     def tearDown(self):
         self.temp.cleanup()
 
     def test_all_supported_and_inferred_claims_use_type_one(self):
         self.assertEqual(set(helper.VERIFIED), set(range(1, 14)))
-        self.assertEqual(helper.INFERRED, set(range(6, 12)))
+        self.assertEqual(helper.INFERRED, set(range(7, 13)))
         api = FakeAPI([task(i, 1) for i in range(1, 14)])
         report = {}
         self.assertEqual(automation.run(api, {}, self.root, report=report), 0)
@@ -119,13 +121,22 @@ class AutomationTests(unittest.TestCase):
         api2 = FakeAPI([task(6, 0)])
         self.assertEqual(automation.run(api2, {}, self.root), 0)
 
-    def test_daily_only_skips_unverified_task_types(self):
-        # 自动执行只领每日任务；每周与活动任务记为需手动领取，不提交请求。
-        api = FakeAPI([task(6, 1), {'id': 9, 'status': 1, 'type': 1, 'name': '每日任务'}])
+    def test_auto_run_claims_daily_and_weekly_but_not_activity(self):
+        # 列表 type：1=每日 2=每周 3=活动累计。自动执行提交前两类，活动任务只提示。
+        items = [dict(task(1, 1), type=1), dict(task(3, 1), type=2), dict(task(7, 1), type=3)]
+        api = FakeAPI(items)
         report = {}
-        self.assertEqual(automation.run(api, {}, self.root, report=report, daily_only=True), 0)
-        self.assertEqual([c[1]['task_id'] for c in api.calls], ['9'])
-        self.assertEqual([s['id'] for s in report['skipped'] if s['reason'] == 'manual_only'], [6])
+        self.assertEqual(automation.run(api, {}, self.root, report=report,
+                                        auto_types=automation.AUTO_TASK_TYPES), 0)
+        self.assertEqual([call[1]['task_id'] for call in api.calls], ['1', '3'])
+        self.assertEqual([(s['id'], s['reason']) for s in report['skipped']], [(7, 'manual_only')])
+
+    def test_repeatedly_rejected_task_is_not_resubmitted(self):
+        # 服务器明确拒绝到阈值后不再提交，避免调度器每 30 秒对同一任务反复试错。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(3):
+            automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), automation.REJECT_LIMIT)
 
     def test_database_commits_rolls_back_and_closes(self):
         with store.connect(self.root) as db:

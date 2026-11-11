@@ -33,6 +33,16 @@ else:
 # 超时、连接中断、返回非 JSON 属于「结果未知」，必须保留待确认记录，避免重复领取。
 DEFINITIVE = frozenset({'outer_response', 'business', 'auth_mismatch'})
 
+# 自动执行允许领取的任务类别（列表里的 type 字段）：1=每日，2=每周。
+# 领奖接口的 type 参数恒为 1，与任务类别无关——每日任务与每周任务都已验证；
+# 3=活动累计（7~12 号）还没有自动领取的实证，继续只提示、不自动提交。
+AUTO_TASK_TYPES = frozenset({1, 2})
+
+# 同一任务被服务端明确拒绝到此次数后，本次服务运行期间不再重复提交。
+# 调度器每 30 秒一轮，对参数不匹配的任务反复试错有触发风控的风险。
+REJECT_LIMIT = 2
+REJECTED = {}
+
 
 class OperationLock:
     def __init__(self, root, filename='operations.lock'):
@@ -87,18 +97,22 @@ def save_state(path, state):
 # 一次完整执行：先查询，筛选可领取白名单任务，每次提交前后重新核对。结果未知立即停止，并用待确认记录阻止下次盲目重试。
 # state_dir 指定待确认记录所在目录：多账号时每个角色各自一份，互不影响。
 def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True,
-        state_dir=None, daily_only=False):
+        state_dir=None, auto_types=None):
     report = report if report is not None else {}
     report.update(sign="not_checked", claimed=[], skipped=[], message="")
     report['errors'] = []
+    scope = str(Path(state_dir or root))
 
-    # 领奖只针对状态 1 且在领取白名单内的任务；自动执行再限定每日任务（type=1）。
-    # 每周与活动任务的领奖参数没有逐项验证过，自动重试只会持续被服务端拒绝。
+    # 领奖只针对状态 1 且在领取白名单内的任务；auto_types 非空时再限定任务类别。
     def claimable(source):
         return [t for t in source if t['status'] == 1 and t['id'] in helper.VERIFIED]
 
+    def blocked(tid):
+        return REJECTED.get((scope, tid), 0) >= REJECT_LIMIT
+
     def ids(source):
-        return sorted(set(t['id'] for t in source if not daily_only or t['type'] == 1))
+        return sorted(set(t['id'] for t in source
+                           if (auto_types is None or t['type'] in auto_types) and not blocked(t['id'])))
 
     report['stage'] = '查询签到状态'
     signed = helper.sign_status(config)
@@ -112,7 +126,9 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
     report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'not_verified'}
                          for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
     report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'manual_only'}
-                          for t in picked if daily_only and t['type'] != 1]
+                          for t in picked if auto_types is not None and t['type'] not in auto_types]
+    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'rejected_repeatedly'}
+                          for t in picked if blocked(t['id'])]
     guard = Path(state_dir or root) / 'pending-operation.json'
     if guard.exists():
         pending = json.loads(guard.read_text(encoding='utf-8'))
@@ -150,9 +166,16 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
                 report['sign'] = 'failed'
             if definitive:
                 guard.unlink(missing_ok=True)
+                if action != 'sign':
+                    key = (scope, action)
+                    REJECTED[key] = REJECTED.get(key, 0) + 1
+                    if REJECTED[key] >= REJECT_LIMIT:
+                        print('BLOCKED {}'.format(action), flush=True)
                 return 'rejected'
             return 'unknown'
         guard.unlink()
+        if action != 'sign':
+            REJECTED.pop((scope, action), None)
         if action == 'sign':
             report['sign'] = 'signed_now'
         else:
@@ -274,8 +297,8 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
                 if not isinstance(config, dict):
                     raise ValueError('账号凭据格式无效')
                 # 该角色的待确认记录放在自己的目录里，不同角色之间不会互相阻塞。
-                # 自动执行只领每日任务，避免每分钟对未验证的每周/活动任务重复提交。
-                code = run(helper, config, root, check_only, report, daily_only=True,
+                # 自动执行领每日与每周任务；活动任务（3）还没取得自动领取实证，仍只提示。
+                code = run(helper, config, root, check_only, report, auto_types=AUTO_TASK_TYPES,
                            state_dir=accounts.account_dir(root, item['id']))
             except Exception as exc:
                 error = error_info(exc, report.get('stage', '读取账号配置'))
