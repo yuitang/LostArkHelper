@@ -6,7 +6,7 @@ type Run = {
   id: number; started: string; finished?: string; outcome: string
   email_status?: string; email_reason?: string
   details: {
-    sign?: string; claimed?: { id: number; name: string }[]; skipped?: { id: number; name: string }[]
+    sign?: string; claimed?: { id: number; name: string }[]; skipped?: { id: number; name: string; reason?: string }[]
     message?: string; pending?: number | string; check_only?: boolean; trigger?: string
     account?: { id: string; role?: string }
   }
@@ -112,7 +112,10 @@ export function HistoryPanel({ accounts, active }: { accounts: GameAccount[]; ac
             {run.details.claimed?.length ? <ul>{run.details.claimed.map(task => <li key={task.id}><CheckCircle2 size={14}/>{task.name}<span>#{task.id}</span></li>)}</ul>
               : <p>{run.details.check_only ? '只查询验证，未执行奖励领取。' : run.outcome === 'success' ? '无，本次没有需要领取的已收录奖励。' : '暂无已确认领取的奖励。'}</p>}
           </div>
-          {!!run.details.skipped?.length && <p className="run-muted">未收录而跳过：{run.details.skipped.map(t => `${t.name}（#${t.id}）`).join('、')}</p>}
+          {!!run.details.skipped?.filter(t => t.reason !== 'manual_only').length &&
+            <p className="run-muted">未收录而跳过：{run.details.skipped.filter(t => t.reason !== 'manual_only').map(t => `${t.name}（#${t.id}）`).join('、')}</p>}
+          {!!run.details.skipped?.filter(t => t.reason === 'manual_only').length &&
+            <p className="run-muted">自动执行只领每日任务，以下需在游戏内领取：{run.details.skipped.filter(t => t.reason === 'manual_only').map(t => `${t.name}（#${t.id}）`).join('、')}</p>}
           {run.details.message && <p className="run-warning">{run.details.message}</p>}
           {run.email_status && <p className="run-muted">邮件提醒：{run.email_status === 'sent' ? '已发送' : run.email_status === 'sending' ? '发送中' : run.email_reason || '发送未确认'}</p>}
         </article>)}</div>}

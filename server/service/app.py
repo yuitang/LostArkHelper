@@ -3,6 +3,8 @@
 import json
 import os
 import secrets
+import threading
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -375,9 +377,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             lock.release()
 
+# 内建调度：上游靠外部 cron 调用 automation.py，Windows 本地部署没有 cron，
+# 服务开着就应当自己按时执行。每 30 秒扫描一次，是否到期与去重仍由 store.due 和时间槽负责。
+def scheduler_loop(root):
+    import automation
+    while True:
+        try:
+            for user in auth.all_users(root):
+                try:
+                    user_root = auth.user_root(root, user, create=False)
+                    if not user_root.is_dir():
+                        continue
+                    automation.execute_user(user_root, helper, False, False,
+                                            notifications.callback(root, user, user_root),
+                                            account=(root, user))
+                except Exception:
+                    # 单个用户失败不影响其他用户；细节写在该用户的运行记录里。
+                    print('SCHEDULER: 单个用户执行失败，详见运行记录。', flush=True)
+        except Exception:
+            print('SCHEDULER: 本轮调度失败，稍后重试。', flush=True)
+        time.sleep(30)
+
+
 if __name__ == '__main__':
     os.umask(0o077)
     auth.initialize(ROOT)
+    # ARK_SCHEDULER=0 可关闭内建调度，避免与系统级计划任务重复执行。
+    if os.environ.get('ARK_SCHEDULER', '1') != '0':
+        threading.Thread(target=scheduler_loop, args=(ROOT,), daemon=True, name='ark-scheduler').start()
     server = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     server.timeout = 30
     server.serve_forever()

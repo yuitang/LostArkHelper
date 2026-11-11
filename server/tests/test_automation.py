@@ -18,10 +18,11 @@ class FakeAPI:
     VERIFIED = helper.VERIFIED
     ApiError = helper.ApiError
 
-    def __init__(self, items, signed=True, uncertain=False):
+    def __init__(self, items, signed=True, uncertain=False, reject=False):
         self.items = items
         self.signed = signed
         self.uncertain = uncertain
+        self.reject = reject
         self.calls = []
 
     def sign_status(self, config):
@@ -34,6 +35,8 @@ class FakeAPI:
         self.calls.append((endpoint, extra))
         if self.uncertain:
             raise helper.ApiError('模拟超时', 'timeout')
+        if self.reject:
+            raise helper.ApiError('查询任务信息失败！', 'outer_response', endpoint, -1)
         if endpoint == self.SIGN_IN:
             self.signed = True
             for t in self.items:
@@ -104,6 +107,25 @@ class AutomationTests(unittest.TestCase):
         api = FakeAPI([task(7, 0)], signed=False)
         self.assertEqual(automation.run(api, {}, self.root), 0)
         self.assertEqual(api.calls, [('sign', None), ('claim', {'task_id': '7', 'type': '1'})])
+
+    def test_definitive_rejection_does_not_lock_the_account(self):
+        # 服务端明确拒绝说明提交未生效，不能留下待确认记录，否则该角色会永久无法再执行。
+        api = FakeAPI([task(6, 1)], reject=True)
+        report = {}
+        self.assertEqual(automation.run(api, {}, self.root, report=report), 1)
+        self.assertIn('服务端明确拒绝', report['message'])
+        self.assertFalse((self.root/'pending-operation.json').exists())
+        # 下一次执行不应被「结果未确认」挡住。
+        api2 = FakeAPI([task(6, 0)])
+        self.assertEqual(automation.run(api2, {}, self.root), 0)
+
+    def test_daily_only_skips_unverified_task_types(self):
+        # 自动执行只领每日任务；每周与活动任务记为需手动领取，不提交请求。
+        api = FakeAPI([task(6, 1), {'id': 9, 'status': 1, 'type': 1, 'name': '每日任务'}])
+        report = {}
+        self.assertEqual(automation.run(api, {}, self.root, report=report, daily_only=True), 0)
+        self.assertEqual([c[1]['task_id'] for c in api.calls], ['9'])
+        self.assertEqual([s['id'] for s in report['skipped'] if s['reason'] == 'manual_only'], [6])
 
     def test_database_commits_rolls_back_and_closes(self):
         with store.connect(self.root) as db:

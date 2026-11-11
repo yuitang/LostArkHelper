@@ -29,6 +29,11 @@ else:
     _flock = fcntl.flock
 
 
+# 服务端明确拒绝的响应类型：这些情况下请求确实没有被受理，可以安全地清除待确认记录。
+# 超时、连接中断、返回非 JSON 属于「结果未知」，必须保留待确认记录，避免重复领取。
+DEFINITIVE = frozenset({'outer_response', 'business', 'auth_mismatch'})
+
+
 class OperationLock:
     def __init__(self, root, filename='operations.lock'):
         self.path = Path(root) / filename
@@ -81,20 +86,33 @@ def save_state(path, state):
 
 # 一次完整执行：先查询，筛选可领取白名单任务，每次提交前后重新核对。结果未知立即停止，并用待确认记录阻止下次盲目重试。
 # state_dir 指定待确认记录所在目录：多账号时每个角色各自一份，互不影响。
-def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True, state_dir=None):
+def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True,
+        state_dir=None, daily_only=False):
     report = report if report is not None else {}
     report.update(sign="not_checked", claimed=[], skipped=[], message="")
     report['errors'] = []
+
+    # 领奖只针对状态 1 且在领取白名单内的任务；自动执行再限定每日任务（type=1）。
+    # 每周与活动任务的领奖参数没有逐项验证过，自动重试只会持续被服务端拒绝。
+    def claimable(source):
+        return [t for t in source if t['status'] == 1 and t['id'] in helper.VERIFIED]
+
+    def ids(source):
+        return sorted(set(t['id'] for t in source if not daily_only or t['type'] == 1))
+
     report['stage'] = '查询签到状态'
     signed = helper.sign_status(config)
     report['sign'] = 'already_signed' if signed else 'unsigned'
     report['stage'] = '查询任务列表'
     items = helper.tasks(config)
-    candidates = sorted(set(t['id'] for t in items
-                            if t['status'] == 1 and t['id'] in helper.VERIFIED))
+    picked = claimable(items)
+    candidates = ids(picked)
     unknown = sum(t['status'] == 1 and t['id'] not in helper.VERIFIED for t in items)
     print('CHECK signed={} claimable={} skipped_unsupported={}'.format(signed, candidates, unknown), flush=True)
-    report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100]} for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
+    report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'not_verified'}
+                         for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
+    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'manual_only'}
+                          for t in picked if daily_only and t['type'] != 1]
     guard = Path(state_dir or root) / 'pending-operation.json'
     if guard.exists():
         pending = json.loads(guard.read_text(encoding='utf-8'))
@@ -109,6 +127,8 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         return 0
 
     # 提交一笔签到或奖励操作，并确认实际状态；结果未知时不能等同于失败后安全重试。
+    # 返回 ok / rejected / unknown：只有 rejected（服务端明确拒绝）才能清除待确认记录，
+    # 否则一次参数错误就会把该角色永久锁在「结果未确认」上，连签到都无法再执行。
     def mutate(action, send, confirm):
         label = '签到' if action == 'sign' else '领取任务 #{}'.format(action)
         report['stage'] = label + '提交'
@@ -122,11 +142,16 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
                 raise helper.ApiError('接口返回成功，但刷新后的状态未确认成功', 'unconfirmed')
         except Exception as exc:
             info = error_info(exc, report['stage'])
-            info['summary'] += '。请前往账号管理更新 token 后重试。'
+            definitive = getattr(exc, 'kind', None) in DEFINITIVE
+            info['summary'] += ('。服务端明确拒绝，本次提交未生效。' if definitive
+                                else '。请前往账号管理更新 token 后重试。')
             report['errors'].append(info)
             if action == 'sign':
                 report['sign'] = 'failed'
-            return False
+            if definitive:
+                guard.unlink(missing_ok=True)
+                return 'rejected'
+            return 'unknown'
         guard.unlink()
         if action == 'sign':
             report['sign'] = 'signed_now'
@@ -136,17 +161,17 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         if report.get('run_id'):
             store.update(root, report['run_id'], report)
         print('CONFIRMED {}'.format(action), flush=True)
-        return True
+        return 'ok'
 
     if not signed and allow_sign:
-        if not mutate('sign', lambda: helper.request(config, helper.SIGN_IN),
-                      lambda: helper.sign_status(config)):
+        if mutate('sign', lambda: helper.request(config, helper.SIGN_IN),
+                  lambda: helper.sign_status(config)) != 'ok':
             report['message'] = '；'.join(e['summary'] for e in report['errors'])
             return 1
         # 本次签到可能刚好解锁累计签到奖励，刷新后再筛选候选。
         items = helper.tasks(config)
-        candidates = sorted(set(t['id'] for t in items
-                                if t['status'] == 1 and t['id'] in helper.VERIFIED))
+        picked = claimable(items)
+        candidates = ids(picked)
     for tid in candidates if allow_claim else []:
         report['stage'] = '领取任务 #{} 前查询'.format(tid)
         current = [t for t in helper.tasks(config) if t['id'] == tid]
@@ -155,9 +180,12 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         def confirmed():
             after = [t for t in helper.tasks(config) if t['id'] == tid]
             return len(after) == 1 and after[0]['status'] == 2
-        if not mutate(tid, lambda: helper.request(config, helper.CLAIM,
-               {'task_id': str(tid), 'type': str(helper.VERIFIED[tid])}), confirmed):
+        outcome = mutate(tid, lambda: helper.request(config, helper.CLAIM,
+                         {'task_id': str(tid), 'type': str(helper.VERIFIED[tid])}), confirmed)
+        if outcome == 'unknown':
+            # 结果未知：继续提交可能重复领取，必须停在原地等人工确认。
             break
+        # 服务端明确拒绝某项任务时继续处理下一项，单项不支持不应中断整轮。
     report['stage'] = '执行完成'
     report['message'] = '；'.join(e['summary'] for e in report['errors'])
     return 1 if report['errors'] else 0
@@ -246,7 +274,8 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
                 if not isinstance(config, dict):
                     raise ValueError('账号凭据格式无效')
                 # 该角色的待确认记录放在自己的目录里，不同角色之间不会互相阻塞。
-                code = run(helper, config, root, check_only, report,
+                # 自动执行只领每日任务，避免每分钟对未验证的每周/活动任务重复提交。
+                code = run(helper, config, root, check_only, report, daily_only=True,
                            state_dir=accounts.account_dir(root, item['id']))
             except Exception as exc:
                 error = error_info(exc, report.get('stage', '读取账号配置'))
