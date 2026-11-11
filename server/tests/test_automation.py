@@ -132,11 +132,22 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual([(s['id'], s['reason']) for s in report['skipped']], [(7, 'manual_only')])
 
     def test_repeatedly_rejected_task_is_not_resubmitted(self):
-        # 服务器明确拒绝到阈值后不再提交，避免调度器每 30 秒对同一任务反复试错。
+        # 服务器明确拒绝到阈值后进入冷却，避免调度器每 30 秒对同一任务反复试错。
         api = FakeAPI([task(3, 1)], reject=True)
         for _ in range(3):
             automation.run(api, {}, self.root)
         self.assertEqual(len(api.calls), automation.REJECT_LIMIT)
+
+    def test_cooldown_expiry_retries_instead_of_giving_up(self):
+        # 冷却到期后必须再试一次：任务可能只是「后来才变成可领取」，永久放弃会漏领。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(2):
+            automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 2)
+        for entry in automation.REJECTED.values():
+            entry[1] = 0
+        automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 3)
 
     def test_database_commits_rolls_back_and_closes(self):
         with store.connect(self.root) as db:

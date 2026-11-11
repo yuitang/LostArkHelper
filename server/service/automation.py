@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import time
 import store
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +39,11 @@ DEFINITIVE = frozenset({'outer_response', 'business', 'auth_mismatch'})
 # 3=活动累计（7~12 号）还没有自动领取的实证，继续只提示、不自动提交。
 AUTO_TASK_TYPES = frozenset({1, 2})
 
-# 同一任务被服务端明确拒绝到此次数后，本次服务运行期间不再重复提交。
-# 调度器每 30 秒一轮，对参数不匹配的任务反复试错有触发风控的风险。
+# 同一任务被服务端明确拒绝到此次数后进入冷却，冷却到期再试一次；成功则计数清零。
+# 调度器每 30 秒一轮，对参数不匹配的任务反复试错有触发风控的风险；
+# 但永久放弃会让「后来才变成可领取」的任务永远漏领，所以只做冷却、不做拉黑。
 REJECT_LIMIT = 2
+REJECT_COOLDOWN = 6 * 3600
 REJECTED = {}
 
 
@@ -108,7 +111,8 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         return [t for t in source if t['status'] == 1 and t['id'] in helper.VERIFIED]
 
     def blocked(tid):
-        return REJECTED.get((scope, tid), 0) >= REJECT_LIMIT
+        entry = REJECTED.get((scope, tid))
+        return bool(entry) and time.time() < entry[1]
 
     def ids(source):
         return sorted(set(t['id'] for t in source
@@ -127,7 +131,7 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
                          for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
     report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'manual_only'}
                           for t in picked if auto_types is not None and t['type'] not in auto_types]
-    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'rejected_repeatedly'}
+    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'cooling_down'}
                           for t in picked if blocked(t['id'])]
     guard = Path(state_dir or root) / 'pending-operation.json'
     if guard.exists():
@@ -167,10 +171,11 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
             if definitive:
                 guard.unlink(missing_ok=True)
                 if action != 'sign':
-                    key = (scope, action)
-                    REJECTED[key] = REJECTED.get(key, 0) + 1
-                    if REJECTED[key] >= REJECT_LIMIT:
-                        print('BLOCKED {}'.format(action), flush=True)
+                    entry = REJECTED.setdefault((scope, action), [0, 0])
+                    entry[0] += 1
+                    if entry[0] >= REJECT_LIMIT:
+                        entry[1] = time.time() + REJECT_COOLDOWN
+                        print('COOLDOWN {}'.format(action), flush=True)
                 return 'rejected'
             return 'unknown'
         guard.unlink()
