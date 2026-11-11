@@ -163,8 +163,11 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         except Exception as exc:
             info = error_info(exc, report['stage'])
             definitive = getattr(exc, 'kind', None) in DEFINITIVE
-            info['summary'] += ('。服务端明确拒绝，本次提交未生效。' if definitive
-                                else '。请前往账号管理更新 token 后重试。')
+            # 查询接口不校验活动 token，领奖接口校验：token 失效时查询照常返回可领取，
+            # 领奖却报「查询任务信息失败」，这个文案极易被误读成任务或区服参数有问题。
+            info['summary'] += ('。服务端明确拒绝，本次提交未生效；若该任务一直显示可领取，'
+                                '通常是活动 token 已失效，请重新导入账号链接更新 token。'
+                                if definitive else '。请前往账号管理更新 token 后重试。')
             report['errors'].append(info)
             if action == 'sign':
                 report['sign'] = 'failed'
