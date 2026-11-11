@@ -75,6 +75,13 @@ class ImportTests(unittest.TestCase):
             with self.subTest(updates=updates), self.assertRaises(ValueError):
                 import_link.parse_link(sample_link(**updates))
 
+    def test_wechat_link_reports_read_only_reason(self):
+        """微信分享链接只有查看权限；错误文案要说清根因，而不是笼统的“链接无效”。"""
+        with self.assertRaisesRegex(ValueError, '微信'):
+            import_link.parse_link(sample_link(accType='wx', appid='wx121402bba4b7bda6',
+                                               uin='ol7y7uOq1eDVdi-FtJ1t42m6lDD0',
+                                               access_token=''))
+
     def test_pending_error_invites_token_update(self):
         class Fake:
             VERIFIED = helper.VERIFIED

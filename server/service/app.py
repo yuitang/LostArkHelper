@@ -292,8 +292,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     config, info = importer.parse_link(obj['url'])
                     account_id = accounts.config_id(config)
-                except (ValueError, accounts.AccountError):
-                    return self.reply(400, {'error': '分享链接无效，请从官方 App 复制支持的活动链接。'})
+                except (ValueError, accounts.AccountError) as exc:
+                    # 解析失败的文案都是固定语句（只含字段名，不含用户输入），可以原样回显，
+                    # 让用户在页面上直接看出卡在哪一项，不必对着笼统提示猜。
+                    reason = str(exc).strip()
+                    if not reason or len(reason) > 120:
+                        reason = '分享链接无效，请从官方 App 复制支持的活动链接。'
+                    return self.reply(400, {'error': reason})
                 existing = accounts.exists(root, account_id)
                 if existing and obj.get('replace') is not True:
                     return self.reply(409, {'error': '该角色已绑定，请勾选确认更新后再提交；如需换角色请新增账号。'})
