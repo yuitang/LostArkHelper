@@ -18,10 +18,11 @@ class FakeAPI:
     VERIFIED = helper.VERIFIED
     ApiError = helper.ApiError
 
-    def __init__(self, items, signed=True, uncertain=False):
+    def __init__(self, items, signed=True, uncertain=False, reject=False):
         self.items = items
         self.signed = signed
         self.uncertain = uncertain
+        self.reject = reject
         self.calls = []
 
     def sign_status(self, config):
@@ -34,6 +35,8 @@ class FakeAPI:
         self.calls.append((endpoint, extra))
         if self.uncertain:
             raise helper.ApiError('模拟超时', 'timeout')
+        if self.reject:
+            raise helper.ApiError('查询任务信息失败！', 'outer_response', endpoint, -1)
         if endpoint == self.SIGN_IN:
             self.signed = True
             for t in self.items:
@@ -53,13 +56,15 @@ class AutomationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # 拒绝计数是进程级的状态，测试之间必须清空，否则会互相屏蔽任务。
+        automation.REJECTED.clear()
 
     def tearDown(self):
         self.temp.cleanup()
 
     def test_all_supported_and_inferred_claims_use_type_one(self):
         self.assertEqual(set(helper.VERIFIED), set(range(1, 14)))
-        self.assertEqual(helper.INFERRED, set(range(6, 12)))
+        self.assertEqual(helper.INFERRED, set(range(7, 13)))
         api = FakeAPI([task(i, 1) for i in range(1, 14)])
         report = {}
         self.assertEqual(automation.run(api, {}, self.root, report=report), 0)
@@ -104,6 +109,56 @@ class AutomationTests(unittest.TestCase):
         api = FakeAPI([task(7, 0)], signed=False)
         self.assertEqual(automation.run(api, {}, self.root), 0)
         self.assertEqual(api.calls, [('sign', None), ('claim', {'task_id': '7', 'type': '1'})])
+
+    def test_definitive_rejection_does_not_lock_the_account(self):
+        # 服务端明确拒绝说明提交未生效，不能留下待确认记录，否则该角色会永久无法再执行。
+        api = FakeAPI([task(6, 1)], reject=True)
+        report = {}
+        self.assertEqual(automation.run(api, {}, self.root, report=report), 1)
+        self.assertIn('服务端明确拒绝', report['message'])
+        self.assertFalse((self.root/'pending-operation.json').exists())
+        # 下一次执行不应被「结果未确认」挡住。
+        api2 = FakeAPI([task(6, 0)])
+        self.assertEqual(automation.run(api2, {}, self.root), 0)
+
+    def test_auto_run_claims_daily_and_weekly_but_not_activity(self):
+        # 列表 type：1=每日 2=每周 3=活动累计。自动执行提交前两类，活动任务只提示。
+        items = [dict(task(1, 1), type=1), dict(task(3, 1), type=2), dict(task(7, 1), type=3)]
+        api = FakeAPI(items)
+        report = {}
+        self.assertEqual(automation.run(api, {}, self.root, report=report,
+                                        auto_types=automation.AUTO_TASK_TYPES), 0)
+        self.assertEqual([call[1]['task_id'] for call in api.calls], ['1', '3'])
+        self.assertEqual([(s['id'], s['reason']) for s in report['skipped']], [(7, 'manual_only')])
+
+    def test_repeatedly_rejected_task_is_not_resubmitted(self):
+        # 服务器明确拒绝到阈值后进入冷却，避免调度器每 30 秒对同一任务反复试错。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(3):
+            automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), automation.REJECT_LIMIT)
+
+    def test_cooldown_expiry_retries_instead_of_giving_up(self):
+        # 冷却到期后必须再试一次：任务可能只是「后来才变成可领取」，永久放弃会漏领。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(2):
+            automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 2)
+        for entry in automation.REJECTED.values():
+            entry[1] = 0
+        automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 3)
+
+    def test_cooldown_cleared_when_credentials_are_updated(self):
+        # 更新 token 就是为了让它能领到，冷却不能把这次修复挡住。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(2):
+            automation.run(api, {}, self.root)
+        self.assertTrue(automation.REJECTED)
+        automation.clear_cooldowns(self.root)
+        self.assertFalse(automation.REJECTED)
+        automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 3)
 
     def test_database_commits_rolls_back_and_closes(self):
         with store.connect(self.root) as db:

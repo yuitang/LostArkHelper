@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import smtplib
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import automation
 import helper
 import notifications
 import store
-from test_import import sample_link
+from test_import import account_dir, account_guard, sample_link, write_account
 
 
 class ManagementTests(unittest.TestCase):
@@ -110,14 +111,14 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(store.settings(self.root)['minute'], 0)
         custom = dict(store.DEFAULT, minute=28)
         store.settings(self.root, custom)
-        (self.root/'config-dashboard.json').unlink()
+        shutil.rmtree(account_dir(self.root))
         with patch.object(store.secrets, 'randbelow') as random:
             self.request('/api/import', dict(url=sample_link()))
             random.assert_not_called()
         self.assertEqual(store.settings(self.root), custom)
 
     def test_existing_account_updates_do_not_auto_enable_or_randomize(self):
-        (self.root/'config-dashboard.json').write_text(json.dumps(app.importer.parse_link(sample_link())[0]))
+        write_account(self.root)
         before = dict(store.DEFAULT, mode='daily', times=['11:25'])
         store.settings(self.root, before)
         with patch.object(store.secrets, 'randbelow') as random:
@@ -131,7 +132,7 @@ class ManagementTests(unittest.TestCase):
         self.assertFalse(store.settings(self.root)['enabled'])
         self.assertFalse((self.root/'config-dashboard.json').exists())
         self.login.side_effect = None
-        with patch.object(app, 'save_state', side_effect=OSError()):
+        with patch.object(automation, 'save_state', side_effect=OSError()):
             self.assertEqual(self.request('/api/import', dict(url=sample_link()))[0], 500)
         self.assertFalse(store.settings(self.root)['enabled'])
 
@@ -159,7 +160,9 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data['has_authorization_code'])
         self.assertNotIn('abcdefghijklmnop', json.dumps(data))
-        self.assertEqual((self.base/notifications.MAIL_FILE).stat().st_mode & 0o777, 0o600)
+        # 0600 权限位是 POSIX 语义；Windows 走 NTFS ACL，st_mode 不返回 Unix 权限。
+        if os.name != 'nt':
+            self.assertEqual((self.base/notifications.MAIL_FILE).stat().st_mode & 0o777, 0o600)
         self.assertNotIn('authorization_code', self.request('/api/admin/mail')[1])
         self.assertEqual(self.request('/api/admin/mail', dict(payload, enabled=False, authorization_code=''))[0], 200)
         self.assertEqual(notifications.load_mail(self.base)['authorization_code'], 'abcdefghijklmnop')
@@ -206,7 +209,7 @@ class ManagementTests(unittest.TestCase):
 
     def test_partial_run_failure_sends_once_and_notification_error_is_independent(self):
         self.configure_mail()
-        (self.root/'config-dashboard.json').write_text(json.dumps(app.importer.parse_link(sample_link())[0]))
+        write_account(self.root)
         with patch.object(helper, 'sign_status', return_value=True), patch.object(helper, 'tasks',
                 return_value=[dict(id=1, type=1, name='登录游戏', status=1)]), patch.object(helper, 'request',
                 side_effect=helper.ApiError('模拟未确认', 'unconfirmed')) as submit:
@@ -228,7 +231,7 @@ class ManagementTests(unittest.TestCase):
     def test_manual_and_scheduled_errors_use_same_notification_hook(self):
         self.configure_mail()
         store.settings(self.root, dict(store.DEFAULT, enabled=True))
-        (self.root/'config-dashboard.json').write_text(json.dumps(app.importer.parse_link(sample_link())[0]))
+        write_account(self.root)
         with patch.object(helper, 'sign_status', side_effect=helper.ApiError('请更新 token', 'auth_invalid')):
             self.assertEqual(self.request('/api/run', {})[0], 500)
             self.assertEqual(automation.execute_user(self.root, helper, run_now=True,
@@ -254,8 +257,8 @@ class ManagementTests(unittest.TestCase):
         store.settings(self.root, dict(store.DEFAULT, enabled=True))
         run_id = store.begin(self.root, None)
         store.update(self.root, run_id, dict(trigger='scheduled'), 'success')
-        (self.root/'config-dashboard.json').write_text('private fake token')
-        (self.root/'pending-operation.json').write_text('{}')
+        write_account(self.root, config='private fake token')
+        account_guard(self.root).write_text('{}')
         owner_token = auth.new_session(self.base, self.owner)
         self.current[0] = self.owner
         result, data = self.request('/api/admin/users/delete', dict(id=self.user['id'], username='tester'))
@@ -333,7 +336,7 @@ class ManagementTests(unittest.TestCase):
         self.assertGreater(replacement['id'], self.user['id'])
 
     def test_scheduler_checks_enabled_plan_inside_account_lock(self):
-        (self.root/'config-dashboard.json').write_text('{}')
+        write_account(self.root, config='{}')
         with patch.object(helper, 'sign_status') as game:
             self.assertEqual(automation.execute_user(self.root, helper, run_now=True,
                             account=(self.base, self.user)), 0)
@@ -345,7 +348,7 @@ class ManagementTests(unittest.TestCase):
                 ('scheduled_now','interrupted',False),('manual','success',False),('scheduled','success',True),('scheduled','skipped',False)):
             run_id = store.begin(self.root, None)
             store.update(self.root, run_id, dict(trigger=trigger, check_only=check_only), outcome)
-        (self.root/'config-dashboard.json').write_text('{"secret":"must-not-read"}')
+        write_account(self.root, config='{"secret":"must-not-read"}')
         self.current[0] = self.owner
         status, data = self.request('/api/admin/users?limit=1&offset=1')
         self.assertEqual(status, 200)
@@ -363,7 +366,7 @@ class ManagementTests(unittest.TestCase):
     def test_migrates_legacy_schema_without_losing_sessions_or_passwords(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            with sqlite3.connect(root/'users.sqlite3') as db:
+            with closing(sqlite3.connect(root/'users.sqlite3')) as db, db:
                 db.execute('CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,password TEXT,created INTEGER,legacy INTEGER)')
                 db.execute("INSERT INTO users VALUES (1,'ark','opaque-hash',123,1)")
                 db.execute("INSERT INTO users VALUES (2,'other','other-hash',124,0)")

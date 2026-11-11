@@ -3,14 +3,17 @@
 import json
 import os
 import secrets
+import threading
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlsplit, parse_qs
-from automation import OperationLock, run, save_state, error_info, finish_run
+from automation import OperationLock, run, error_info, finish_run, clear_cooldowns
 import store
 import auth
+import accounts
 import helper
 import import_link as importer
 import admin
@@ -22,31 +25,34 @@ PORT = int(os.environ.get('ARK_PORT', '18745'))
 PUBLIC_ORIGIN = os.environ.get('ARK_PUBLIC_ORIGIN', 'https://lostarkhelper.dpdns.org').rstrip('/')
 COOKIE = 'ark_session'
 
-# 读取当前账号的游戏凭据；只供后端内部调用，不能把返回值直接输出到网页或日志。
-def read_config(root):
-    obj = json.loads((root / 'config-dashboard.json').read_text(encoding='utf-8'))
-    if not isinstance(obj, dict) or not isinstance(obj.get('form'), dict) or not isinstance(obj.get('cookie'), str):
-        raise ValueError('invalid')
-    return obj
+# 读取指定角色的游戏凭据；只供后端内部调用，不能把返回值直接输出到网页或日志。
+def read_config(root, account_id):
+    return accounts.read_config(root, account_id)
 
 # 向官方接口查询签到和任务，向网页仅返回展示所需的字段；此函数不提交签到或领奖。
-def status(root):
-    if not (root / 'config-dashboard.json').exists():
-        return {'configured': False, 'source': None}
+# account_id 为空且只有一个账号时自动选中该账号；多账号必须显式指定。
+def status(root, account_id=None):
+    items = accounts.list_accounts(root)
+    if not items:
+        return {'configured': False, 'source': None, 'accounts': []}
     try:
-        config = read_config(root)
+        # 状态查询是只读的：多账号未指定时默认第一个角色，页面按返回值显示当前账号。
+        account_id = accounts.resolve(root, account_id, default_first=True)
+    except accounts.AccountError as exc:
+        return {'configured': False, 'source': None, 'accounts': items, 'error': str(exc)}
+    current = next(item for item in items if item['id'] == account_id)
+    base = {'configured': True, 'source': current['role'], 'account': current, 'accounts': items}
+    try:
+        config = read_config(root, account_id)
         signed = helper.sign_status(config)
         tasks = helper.tasks(config)
         cleaned = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100],
                     'type': t['type'], 'status': t['status'], 'exp': t.get('exp')} for t in tasks]
-        return {'configured': True, 'source': '我的游戏账号', 'signed': signed, 'tasks': cleaned,
-                'time': datetime.now(store.TZ).strftime('%H:%M')}
+        return dict(base, signed=signed, tasks=cleaned, time=datetime.now(store.TZ).strftime('%H:%M'))
     except helper.ApiError as exc:
-        return {'configured': True, 'source': '我的游戏账号',
-                'error': str(exc), 'needs_token_update': exc.kind in ('auth_invalid', 'auth_mismatch')}
+        return dict(base, error=str(exc), needs_token_update=exc.kind in ('auth_invalid', 'auth_mismatch'))
     except Exception:
-        return {'configured': True, 'source': '我的游戏账号',
-                'error': '查询失败，请更新登录凭据或检查活动是否有效。'}
+        return dict(base, error='查询失败，请更新登录凭据或检查活动是否有效。')
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -135,17 +141,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, dict(auth.notification_preferences(ROOT, user),
                                               mail_ready=notifications.public_mail(ROOT)['ready']))
                 if path == '/api/schedule':
-                    value = store.settings(root)
-                    return self.reply(200, dict(value, timezone='Asia/Shanghai', next_run=store.next_run(value)))
+                    items = accounts.list_accounts(root)
+                    plans = store.account_plans(root, [item['id'] for item in items])
+                    return self.reply(200, {
+                        'timezone': 'Asia/Shanghai',
+                        'default_plan': store.settings(root),
+                        'accounts': [dict(item, plan=plans[item['id']], next_run=store.next_run(plans[item['id']]))
+                                     for item in items]})
                 if path == '/api/history':
+                    query = parse_qs(urlsplit(self.path).query)
                     try:
-                        before = int(parse_qs(urlsplit(self.path).query).get('before', ['0'])[0])
+                        before = int(query.get('before', ['0'])[0])
                         if before < 0: raise ValueError()
                     except ValueError:
                         return self.reply(400, {'error': '分页参数无效'})
-                    return self.reply(200, store.history(root, before))
+                    account_id = (query.get('account', [''])[0] or '').strip() or None
+                    if account_id and not accounts.valid_id(account_id):
+                        return self.reply(400, {'error': '账号参数无效。'})
+                    return self.reply(200, store.history(root, before, account_id))
+                if path == '/api/accounts':
+                    return self.reply(200, {'accounts': accounts.list_accounts(root)})
                 if path == '/api/status':
-                    return self.reply(200, status(root))
+                    query = parse_qs(urlsplit(self.path).query)
+                    account_id = (query.get('account', [''])[0] or '').strip() or None
+                    return self.reply(200, status(root, account_id))
                 return self.reply(404, {'error': 'not found'})
             finally:
                 lock.release()
@@ -257,24 +276,36 @@ class Handler(BaseHTTPRequestHandler):
                 auth.notification_preferences(ROOT, user, value)
                 return self.reply(200, dict(value, message='异常邮件提醒设置已保存。'))
             if path == '/api/schedule':
+                account_id = obj.pop('account', None) if isinstance(obj, dict) else None
                 try:
-                    value = store.settings(root, obj)
+                    account_id = accounts.resolve(root, account_id.strip() if isinstance(account_id, str) and account_id.strip() else None)
+                    plan = store.account_settings(root, account_id, obj)
+                except accounts.AccountError as exc:
+                    return self.reply(400, {'error': str(exc)})
                 except ValueError:
                     return self.reply(400, {'error': '时间设置无效，请检查分钟及 HH:MM 格式。'})
-                return self.reply(200, dict(value, timezone='Asia/Shanghai', next_run=store.next_run(value), message='我的定时设置已保存。'))
-            if path == '/api/import':
+                current = next((item for item in accounts.list_accounts(root) if item['id'] == account_id), {'id': account_id})
+                return self.reply(200, dict(plan, timezone='Asia/Shanghai', account=current,
+                                            next_run=store.next_run(plan),
+                                            message='「{}」的定时设置已保存。'.format(current.get('role') or '当前角色')))
+            if path in ('/api/import', '/api/accounts/import'):
                 if not isinstance(obj.get('url'), str):
                     return self.reply(400, {'error': '请填写分享链接。'})
-                file = root / 'config-dashboard.json'
-                configured = file.exists()
-                if configured and obj.get('replace') is not True:
-                    return self.reply(409, {'error': '已有 token，请勾选确认更新后再提交。'})
                 try:
                     config, info = importer.parse_link(obj['url'])
-                except ValueError:
-                    return self.reply(400, {'error': '分享链接无效，请从官方 App 复制支持的活动链接。'})
-                if file.exists():
-                    old = read_config(root)
+                    account_id = accounts.config_id(config)
+                except (ValueError, accounts.AccountError) as exc:
+                    # 解析失败的文案都是固定语句（只含字段名，不含用户输入），可以原样回显，
+                    # 让用户在页面上直接看出卡在哪一项，不必对着笼统提示猜。
+                    reason = str(exc).strip()
+                    if not reason or len(reason) > 120:
+                        reason = '分享链接无效，请从官方 App 复制支持的活动链接。'
+                    return self.reply(400, {'error': reason})
+                existing = accounts.exists(root, account_id)
+                if existing and obj.get('replace') is not True:
+                    return self.reply(409, {'error': '该角色已绑定，请勾选确认更新后再提交；如需换角色请新增账号。'})
+                if existing:
+                    old = read_config(root, account_id)
                     if any(str(old['form'].get(k)) != str(config['form'].get(k)) for k in ('user_id', 'openid', 'sRoleld')):
                         return self.reply(409, {'error': '仅支持更新同一游戏账号和角色的 token，不能在此切换账号。'})
                 # 不能把过期凭据保存成“更新成功”，也不能据此清除待确认记录。
@@ -283,33 +314,59 @@ class Handler(BaseHTTPRequestHandler):
                 except helper.ApiError as exc:
                     return self.reply(400 if exc.kind in ('auth_invalid', 'auth_mismatch') else 503,
                                       {'error': str(exc), 'needs_token_update': exc.kind in ('auth_invalid', 'auth_mismatch')})
-                save_state(file, config)
+                # 首个账号才初始化定时计划；已有其他账号时只新增，不改动已有计划。
+                first = not accounts.list_accounts(root)
+                saved_id, created = accounts.save(root, config, info,
+                                                  added=datetime.now(store.TZ).isoformat(timespec='seconds'))
                 try:
-                    initialized = store.token_imported(root, first_import=not configured)
+                    initialized = store.token_imported(root, saved_id, first_import=first)
                 except Exception:
-                    # 首次计划落盘失败时撤回本次首次配置，重试仍可完整初始化。
-                    if not configured:
-                        file.unlink(missing_ok=True)
+                    # 首次计划落盘失败时撤回本次新增，重试仍可完整初始化。
+                    if created:
+                        accounts.delete(root, saved_id)
                     raise
+                # 凭据刚保存成功：清掉该角色的领奖冷却，否则换了新 token 仍要等冷却到期才重试。
+                clear_cooldowns(accounts.account_dir(root, saved_id))
                 # 已持有该账号的操作锁，且凭据保存成功；允许用新凭据重新查询后执行。
                 # 校验失败、身份不符或写入失败时不会执行到这里，原待确认记录仍保留。
-                pending = root / 'pending-operation.json'
+                pending = accounts.pending_file(root, saved_id)
                 recovered = pending.exists()
                 pending.unlink(missing_ok=True)
                 names = ' / '.join(str(info.get(k) or '未提供')[:100] for k in ('area', 'server', 'role'))
-                schedule = store.settings(root)
-                plan = '。已自动开启每小时第 {} 分钟执行，可在定时设置修改。'.format(schedule['minute']) if initialized else '。定时计划保持原设置。'
-                return self.reply(200, {'message': '我的 token 已保存：' + names + plan + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
-                                        'pending_cleared': recovered, 'schedule_initialized': initialized})
+                current_plan = store.account_settings(root, saved_id)
+                plan_note = '。该角色已启用每小时第 {} 分钟执行，可在定时设置单独调整。'.format(current_plan['minute']) if initialized else ''
+                verb = '角色已添加' if created else '角色 token 已更新'
+                return self.reply(200, {'message': verb + '：' + names + plan_note + ('待确认限制已解除，下次执行将重新查询签到和任务状态。' if recovered else ''),
+                                        'account': next(item for item in accounts.list_accounts(root) if item['id'] == saved_id),
+                                        'created': created, 'pending_cleared': recovered,
+                                        'schedule_initialized': initialized})
+            if path == '/api/accounts/delete':
+                account_id = obj.get('id')
+                if not isinstance(account_id, str) or not account_id.strip():
+                    return self.reply(400, {'error': '请选择要解绑的账号。'})
+                try:
+                    removed = accounts.delete(root, account_id.strip())
+                except accounts.AccountError as exc:
+                    return self.reply(404, {'error': str(exc)})
+                # 该角色的独立计划一并清理，运行历史保留用于审计。
+                store.clear_account_settings(root, removed)
+                remaining = accounts.list_accounts(root)
+                return self.reply(200, {'message': '已解绑该角色：服务器上的登录凭据和待确认记录已删除，运行历史保留。',
+                                        'id': removed, 'accounts': remaining})
             if path not in ('/api/sign', '/api/claim', '/api/run'):
                 return self.reply(404, {'error': 'not found'})
-            if not (root / 'config-dashboard.json').exists():
-                return self.reply(400, {'error': '请先导入自己的游戏账号。'})
-            report = {'trigger': 'manual'}
+            requested = obj.get('account')
+            try:
+                account_id = accounts.resolve(root, requested.strip() if isinstance(requested, str) and requested.strip() else None)
+                config = read_config(root, account_id)
+            except accounts.AccountError as exc:
+                return self.reply(400, {'error': str(exc)})
+            current = next((item for item in accounts.list_accounts(root) if item['id'] == account_id), {'id': account_id})
+            report = {'trigger': 'manual', 'account': current}
             run_id = store.begin(root, None)
             report['run_id'] = run_id
             try:
-                code = run(helper, read_config(root), root, report=report,
+                code = run(helper, config, root, report=report, state_dir=accounts.account_dir(root, account_id),
                            allow_sign=path in ('/api/sign', '/api/run'), allow_claim=path in ('/api/claim', '/api/run'))
             except Exception as exc:
                 report.setdefault('errors', []).append(error_info(exc, report.get('stage', '手动操作')))
@@ -322,9 +379,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             lock.release()
 
+# 内建调度：上游靠外部 cron 调用 automation.py，Windows 本地部署没有 cron，
+# 服务开着就应当自己按时执行。每 30 秒扫描一次，是否到期与去重仍由 store.due 和时间槽负责。
+def scheduler_loop(root):
+    import automation
+    while True:
+        try:
+            for user in auth.all_users(root):
+                try:
+                    user_root = auth.user_root(root, user, create=False)
+                    if not user_root.is_dir():
+                        continue
+                    automation.execute_user(user_root, helper, False, False,
+                                            notifications.callback(root, user, user_root),
+                                            account=(root, user))
+                except Exception:
+                    # 单个用户失败不影响其他用户；细节写在该用户的运行记录里。
+                    print('SCHEDULER: 单个用户执行失败，详见运行记录。', flush=True)
+        except Exception:
+            print('SCHEDULER: 本轮调度失败，稍后重试。', flush=True)
+        time.sleep(30)
+
+
 if __name__ == '__main__':
     os.umask(0o077)
     auth.initialize(ROOT)
+    # ARK_SCHEDULER=0 可关闭内建调度，避免与系统级计划任务重复执行。
+    if os.environ.get('ARK_SCHEDULER', '1') != '0':
+        threading.Thread(target=scheduler_loop, args=(ROOT,), daemon=True, name='ark-scheduler').start()
     server = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     server.timeout = 30
     server.serve_forever()

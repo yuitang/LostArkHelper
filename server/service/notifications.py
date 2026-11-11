@@ -62,15 +62,16 @@ def save_mail(root, value):
         raise ValueError('请填写 QQ 邮箱的 SMTP 授权码（不是邮箱登录密码）。')
     data = dict(enabled=value['enabled'], sender=sender, authorization_code=secret)
     # NamedTemporaryFile 默认 0600；原子替换，避免读到半份配置，也不依赖进程 umask。
+    # 注意必须先关闭临时文件再替换：Windows 不允许对打开中的文件执行 os.replace。
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root, delete=False) as stream:
         temp = Path(stream.name)
-        try:
-            json.dump(data, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.replace(temp, Path(root) / MAIL_FILE)
-        finally:
-            temp.unlink(missing_ok=True)
+        json.dump(data, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.replace(temp, Path(root) / MAIL_FILE)
+    finally:
+        temp.unlink(missing_ok=True)
     return public_mail(root)
 
 
@@ -100,9 +101,12 @@ def build_message(sender, recipient, user, run_id, report):
     message = EmailMessage()
     message['From'], message['To'] = sender, recipient
     message['Subject'] = '命运方舟助手：任务执行异常'
-    message.set_content('账号：{}\n执行记录：#{}\n通知时间：{}（北京时间）\n\n{}\n\n'
+    account = report.get('account') if isinstance(report.get('account'), dict) else {}
+    role = str(account.get('role') or account.get('id') or '')[:100]
+    message.set_content('账号：{}\n角色：{}\n执行记录：#{}\n通知时间：{}（北京时间）\n\n{}\n\n'
                         '请登录工作台查看详情。邮件不包含游戏登录凭据。\n'.format(
-                            user['username'], int(run_id), store.now().strftime('%Y-%m-%d %H:%M:%S'), reason))
+                            user['username'], role or '未提供', int(run_id),
+                            store.now().strftime('%Y-%m-%d %H:%M:%S'), reason))
     return message
 
 

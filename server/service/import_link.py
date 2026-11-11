@@ -28,11 +28,18 @@ def parse_link(link):
         if not values or len(set(values)) != 1 or not values[0].strip():
             raise ValueError('链接缺少参数或同名参数的值不一致：' + name)
         return values[0]
+    # 微信登录的分享链接结构与 QQ 完全不同：acctype=wx、appid 以 wx 开头、uin 不是数字、
+    # 且不含 access_token（服务端只发只读的分享令牌，写操作一律拒绝）。
+    # 提前单独报错，避免落到后面“appid 不一致”这种看不出根因的提示上。
+    acc_values = [value.strip() for value in q.get('acctype', [])]
+    if acc_values and {value.lower() for value in acc_values} == {'wx'}:
+        raise ValueError('这是微信登录的分享链接：它只有查看权限，无法签到或领取奖励，'
+                         '本工具暂不支持导入（需要 QQ 登录的链接）')
     v = {k: one(k) for k in FIELDS}
     if v['appid'] != '102037747':
-        raise ValueError('appid 与本助手的 QQ 登录应用不一致')
+        raise ValueError('链接里的 appid 不是本助手的 QQ 应用，请确认这是「方舟最佳搭档」活动的分享链接')
     if one('acctype') != 'qc':
-        raise ValueError('目前只支持已验证的 QQ 登录（acctype=qc）')
+        raise ValueError('该链接的登录方式不是 QQ（acctype=' + one('acctype') + '），暂不支持')
     access_values = [one(key) for key in ('accessToken', 'access_token') if key.lower() in q]
     if not access_values or len(set(access_values)) != 1:
         raise ValueError('accessToken 缺失或不同字段的值不一致')

@@ -1,11 +1,57 @@
 """Hourly checks with a process-shared lock and durable mutation guard."""
-import fcntl
 import json
 import os
 import threading
+import time
 import store
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Windows 兼容：用 msvcrt.locking 实现与 fcntl.flock 等价的独占文件锁（仅本机单机部署场景）。
+if os.name == 'nt':
+    import errno
+    import msvcrt
+
+    LOCK_EX = 0
+    LOCK_NB = 1
+
+    def _flock(fd, flags):
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK if flags & LOCK_NB else msvcrt.LK_LOCK, 1)
+        except OSError as exc:
+            if flags & LOCK_NB:
+                raise BlockingIOError(errno.EAGAIN, 'resource busy') from exc
+            raise
+else:
+    import fcntl
+
+    LOCK_EX = fcntl.LOCK_EX
+    LOCK_NB = fcntl.LOCK_NB
+    _flock = fcntl.flock
+
+
+# 服务端明确拒绝的响应类型：这些情况下请求确实没有被受理，可以安全地清除待确认记录。
+# 超时、连接中断、返回非 JSON 属于「结果未知」，必须保留待确认记录，避免重复领取。
+DEFINITIVE = frozenset({'outer_response', 'business', 'auth_mismatch'})
+
+# 自动执行允许领取的任务类别（列表里的 type 字段）：1=每日，2=每周。
+# 领奖接口的 type 参数恒为 1，与任务类别无关——每日任务与每周任务都已验证；
+# 3=活动累计（7~12 号）还没有自动领取的实证，继续只提示、不自动提交。
+AUTO_TASK_TYPES = frozenset({1, 2})
+
+# 同一任务被服务端明确拒绝到此次数后进入冷却，冷却到期再试一次；成功则计数清零。
+# 调度器每 30 秒一轮，对参数不匹配的任务反复试错有触发风控的风险；
+# 但永久放弃会让「后来才变成可领取」的任务永远漏领，所以只做冷却、不做拉黑。
+REJECT_LIMIT = 2
+REJECT_COOLDOWN = 6 * 3600
+REJECTED = {}
+
+
+def clear_cooldowns(scope):
+    """凭据更新成功后清掉该角色的领奖冷却：用户已经换了新 token，不该再等冷却到期。"""
+    scope = str(scope)
+    for key in [k for k in REJECTED if k[0] == scope]:
+        REJECTED.pop(key, None)
 
 
 class OperationLock:
@@ -20,7 +66,7 @@ class OperationLock:
             return False
         try:
             self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            _flock(self.fd, LOCK_EX | (0 if blocking else LOCK_NB))
             return True
         except BlockingIOError:
             os.close(self.fd)
@@ -49,29 +95,52 @@ def save_state(path, state):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(str(temp), str(path))
-    fd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # 目录级 fsync 是 POSIX 的持久化手段；Windows 上 os.replace 已保证原子性，跳过该步骤。
+    if os.name != 'nt':
+        fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 # 一次完整执行：先查询，筛选可领取白名单任务，每次提交前后重新核对。结果未知立即停止，并用待确认记录阻止下次盲目重试。
-def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True):
+# state_dir 指定待确认记录所在目录：多账号时每个角色各自一份，互不影响。
+def run(helper, config, root, check_only=False, report=None, allow_sign=True, allow_claim=True,
+        state_dir=None, auto_types=None):
     report = report if report is not None else {}
     report.update(sign="not_checked", claimed=[], skipped=[], message="")
     report['errors'] = []
+    scope = str(Path(state_dir or root))
+
+    # 领奖只针对状态 1 且在领取白名单内的任务；auto_types 非空时再限定任务类别。
+    def claimable(source):
+        return [t for t in source if t['status'] == 1 and t['id'] in helper.VERIFIED]
+
+    def blocked(tid):
+        entry = REJECTED.get((scope, tid))
+        return bool(entry) and time.time() < entry[1]
+
+    def ids(source):
+        return sorted(set(t['id'] for t in source
+                           if (auto_types is None or t['type'] in auto_types) and not blocked(t['id'])))
+
     report['stage'] = '查询签到状态'
     signed = helper.sign_status(config)
     report['sign'] = 'already_signed' if signed else 'unsigned'
     report['stage'] = '查询任务列表'
     items = helper.tasks(config)
-    candidates = sorted(set(t['id'] for t in items
-                            if t['status'] == 1 and t['id'] in helper.VERIFIED))
+    picked = claimable(items)
+    candidates = ids(picked)
     unknown = sum(t['status'] == 1 and t['id'] not in helper.VERIFIED for t in items)
     print('CHECK signed={} claimable={} skipped_unsupported={}'.format(signed, candidates, unknown), flush=True)
-    report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100]} for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
-    guard = Path(root) / 'pending-operation.json'
+    report['skipped'] = [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'not_verified'}
+                         for t in items if t['status'] == 1 and t['id'] not in helper.VERIFIED]
+    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'manual_only'}
+                          for t in picked if auto_types is not None and t['type'] not in auto_types]
+    report['skipped'] += [{'id': t['id'], 'name': str(t.get('name', '未知任务'))[:100], 'reason': 'cooling_down'}
+                          for t in picked if blocked(t['id'])]
+    guard = Path(state_dir or root) / 'pending-operation.json'
     if guard.exists():
         pending = json.loads(guard.read_text(encoding='utf-8'))
         action = pending.get('action')
@@ -85,6 +154,8 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         return 0
 
     # 提交一笔签到或奖励操作，并确认实际状态；结果未知时不能等同于失败后安全重试。
+    # 返回 ok / rejected / unknown：只有 rejected（服务端明确拒绝）才能清除待确认记录，
+    # 否则一次参数错误就会把该角色永久锁在「结果未确认」上，连签到都无法再执行。
     def mutate(action, send, confirm):
         label = '签到' if action == 'sign' else '领取任务 #{}'.format(action)
         report['stage'] = label + '提交'
@@ -98,12 +169,28 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
                 raise helper.ApiError('接口返回成功，但刷新后的状态未确认成功', 'unconfirmed')
         except Exception as exc:
             info = error_info(exc, report['stage'])
-            info['summary'] += '。请前往账号管理更新 token 后重试。'
+            definitive = getattr(exc, 'kind', None) in DEFINITIVE
+            # 查询接口不校验活动 token，领奖接口校验：token 失效时查询照常返回可领取，
+            # 领奖却报「查询任务信息失败」，这个文案极易被误读成任务或区服参数有问题。
+            info['summary'] += ('。服务端明确拒绝，本次提交未生效；若该任务一直显示可领取，'
+                                '通常是活动 token 已失效，请重新导入账号链接更新 token。'
+                                if definitive else '。请前往账号管理更新 token 后重试。')
             report['errors'].append(info)
             if action == 'sign':
                 report['sign'] = 'failed'
-            return False
+            if definitive:
+                guard.unlink(missing_ok=True)
+                if action != 'sign':
+                    entry = REJECTED.setdefault((scope, action), [0, 0])
+                    entry[0] += 1
+                    if entry[0] >= REJECT_LIMIT:
+                        entry[1] = time.time() + REJECT_COOLDOWN
+                        print('COOLDOWN {}'.format(action), flush=True)
+                return 'rejected'
+            return 'unknown'
         guard.unlink()
+        if action != 'sign':
+            REJECTED.pop((scope, action), None)
         if action == 'sign':
             report['sign'] = 'signed_now'
         else:
@@ -112,17 +199,17 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         if report.get('run_id'):
             store.update(root, report['run_id'], report)
         print('CONFIRMED {}'.format(action), flush=True)
-        return True
+        return 'ok'
 
     if not signed and allow_sign:
-        if not mutate('sign', lambda: helper.request(config, helper.SIGN_IN),
-                      lambda: helper.sign_status(config)):
+        if mutate('sign', lambda: helper.request(config, helper.SIGN_IN),
+                  lambda: helper.sign_status(config)) != 'ok':
             report['message'] = '；'.join(e['summary'] for e in report['errors'])
             return 1
         # 本次签到可能刚好解锁累计签到奖励，刷新后再筛选候选。
         items = helper.tasks(config)
-        candidates = sorted(set(t['id'] for t in items
-                                if t['status'] == 1 and t['id'] in helper.VERIFIED))
+        picked = claimable(items)
+        candidates = ids(picked)
     for tid in candidates if allow_claim else []:
         report['stage'] = '领取任务 #{} 前查询'.format(tid)
         current = [t for t in helper.tasks(config) if t['id'] == tid]
@@ -131,9 +218,12 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
         def confirmed():
             after = [t for t in helper.tasks(config) if t['id'] == tid]
             return len(after) == 1 and after[0]['status'] == 2
-        if not mutate(tid, lambda: helper.request(config, helper.CLAIM,
-               {'task_id': str(tid), 'type': str(helper.VERIFIED[tid])}), confirmed):
+        outcome = mutate(tid, lambda: helper.request(config, helper.CLAIM,
+                         {'task_id': str(tid), 'type': str(helper.VERIFIED[tid])}), confirmed)
+        if outcome == 'unknown':
+            # 结果未知：继续提交可能重复领取，必须停在原地等人工确认。
             break
+        # 服务端明确拒绝某项任务时继续处理下一项，单项不支持不应中断整轮。
     report['stage'] = '执行完成'
     report['message'] = '；'.join(e['summary'] for e in report['errors'])
     return 1 if report['errors'] else 0
@@ -164,7 +254,13 @@ def finish_run(root, run_id, report, outcome, notify=None):
 
 
 def execute_user(root, helper, check_only=False, run_now=False, notify=None, account=None):
+    """账号级调度入口：一次持锁，逐个游戏角色执行。
+
+    每个角色独立保存凭据、待确认记录和运行记录行；某个角色失败不影响其他角色。
+    时间槽按「分钟#角色ID」区分，避免同一次计划里多个角色互相去重覆盖。
+    """
     import auth
+    import accounts
     lock = auth.operation_lock(*account) if account else OperationLock(root)
     if not lock.acquire():
         if account:
@@ -172,44 +268,66 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
             print('SKIP: another account operation is running.', flush=True)
             return 0
         at = store.now()
-        if store.due(store.settings(root), at):
+        plans = store.account_plans(root, [item['id'] for item in accounts.list_accounts(root)])
+        if any(store.due(plan, at) for plan in plans.values()):
             with store.connect(root) as db:
                 db.execute("INSERT OR IGNORE INTO runs(slot,started,finished,outcome,details) VALUES (?,?,?,'skipped',?)",
                            (at.strftime('%Y-%m-%dT%H:%M'), at.isoformat(), at.isoformat(), json.dumps({'message':'其他操作正在执行，本次已跳过，避免重复提交。'})))
         print('SKIP: another operation is running.', flush=True)
         return 0
-    run_id = None
-    report = {'check_only': check_only, 'trigger': 'scheduled_now' if run_now else 'scheduled'}
     try:
         if account and (not auth.user_exists(*account) or not root.is_dir()):
             return 0
         at = store.now()
-        schedule = store.settings(root)
-        if not check_only and (not schedule['enabled'] or (not run_now and not store.due(schedule, at))):
+        items = accounts.list_accounts(root)
+        if not items:
+            if check_only:
+                return 0
+            # 没有绑定角色时按用户默认计划每小时只记录一次跳过，避免重复刷历史。
+            if store.due(store.settings(root), at):
+                run_id = store.begin(root, at.strftime('%Y-%m-%dT%H:%M'))
+                if run_id is not None:
+                    store.update(root, run_id, {'check_only': False, 'trigger': 'scheduled',
+                                                'message': '尚未绑定游戏账号，已跳过。'}, 'skipped')
             return 0
-        config_path = root / 'config-dashboard.json'
-        if check_only and not config_path.exists():
-            return 0
-        slot = at.strftime('%Y-%m-%dT%H:%M') if not check_only and not run_now else None
-        run_id = store.begin(root, slot)
-        if run_id is None:
-            return 0
-        report['run_id'] = run_id
-        if not config_path.exists():
-            report['message'] = '未导入面板账号，已跳过。'
-            store.update(root, run_id, report, 'skipped')
-            return 0
-        config = json.loads(config_path.read_text(encoding='utf-8'))
-        code = run(helper, config, root, check_only, report)
-        finish_run(root, run_id, report, 'success' if code == 0 else 'error', notify)
-        return code
+        # 每个角色有独立的开关与执行时间，逐个判断是否到期；某个账号暂停不影响其他账号。
+        plans = store.account_plans(root, [item['id'] for item in items])
+        codes = []
+        for item in items:
+            plan = plans[item['id']]
+            if not check_only and (not plan['enabled'] or (not run_now and not store.due(plan, at))):
+                continue
+            if check_only and not accounts.exists(root, item['id']):
+                continue
+            report = {'check_only': check_only, 'trigger': 'scheduled_now' if run_now else 'scheduled',
+                      'account': item}
+            # 同一分钟内每个角色各占一个时间槽；手动立刻执行不写槽（允许重复手动触发）。
+            slot = at.strftime('%Y-%m-%dT%H:%M') + '#' + item['id'] if not check_only and not run_now else None
+            run_id = store.begin(root, slot)
+            if run_id is None:
+                continue
+            report['run_id'] = run_id
+            try:
+                config = accounts.read_config(root, item['id'])
+                if not isinstance(config, dict):
+                    raise ValueError('账号凭据格式无效')
+                # 该角色的待确认记录放在自己的目录里，不同角色之间不会互相阻塞。
+                # 自动执行领每日与每周任务；活动任务（3）还没取得自动领取实证，仍只提示。
+                code = run(helper, config, root, check_only, report, auto_types=AUTO_TASK_TYPES,
+                           state_dir=accounts.account_dir(root, item['id']))
+            except Exception as exc:
+                error = error_info(exc, report.get('stage', '读取账号配置'))
+                report.setdefault('errors', []).append(error)
+                report['message'] = '；'.join(e['summary'] for e in report['errors'])
+                finish_run(root, run_id, report, 'error', notify)
+                print('ERROR: query/write failed for account {}; see private execution history.'.format(item['id']), flush=True)
+                codes.append(1)
+                continue
+            finish_run(root, run_id, report, 'success' if code == 0 else 'error', notify)
+            codes.append(code)
+        return 1 if any(codes) else 0
     except Exception as exc:
-        error = error_info(exc, report.get('stage', '读取账号配置'))
-        report.setdefault('errors', []).append(error)
-        report['message'] = '；'.join(e['summary'] for e in report['errors'])
-        if run_id:
-            finish_run(root, run_id, report, 'error', notify)
-        print('ERROR: query/write failed; see private execution history. No immediate retry.', flush=True)
+        print('ERROR: scheduled run failed: {}'.format(type(exc).__name__), flush=True)
         return 1
     finally:
         lock.release()

@@ -103,7 +103,9 @@ class LoginTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             # 不同端具有自己的凭据存储；状态测试不触碰真实存储。
-            (root / 'config-dashboard.json').write_text('{}')
+            folder = root / 'accounts' / '456'
+            folder.mkdir(parents=True)
+            (folder / 'config-dashboard.json').write_text('{}')
             with patch.object(app, 'read_config', return_value=self.config):
                 status = app.status(root)
             self.assertTrue(status['needs_token_update'])

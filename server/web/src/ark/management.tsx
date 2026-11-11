@@ -37,7 +37,7 @@ export function NotificationsPanel() {
     } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
   return <section className="panel account-panel management-panel" aria-labelledby="notification-title">
-    <div className="panel-head"><div><h2 id="notification-title">异常邮件提醒</h2><p>定时或手动执行失败时，将提醒发送到你的邮箱。</p></div><Mail size={20} aria-hidden="true" /></div>
+    <div className="panel-head"><div><h2 id="notification-title">异常邮件提醒</h2><p>任一角色定时或手动执行失败时，都会把提醒发送到你的邮箱。</p></div><Mail size={20} aria-hidden="true" /></div>
     {error && <p className="management-error" role="alert">{error}{!value && <button className="text-btn" onClick={() => setRetry(n => n + 1)}>重新加载</button>}</p>}
     {notice && <p className="management-success" role="status">{notice}</p>}
     {!value ? !error && <div className="management-loading" role="status">正在读取邮件提醒设置…</div> : <form className="schedule-form management-form" onSubmit={save}>
@@ -87,7 +87,9 @@ function MailSettingsPanel() {
   </details>
 }
 
+type BoundRole = { id: string; role: string; server?: string; area?: string }
 type AdminUser = { id: number; username: string; created: string; is_admin: boolean; configured: boolean;
+  game_accounts: BoundRole[]; enabled_plans: number;
   delete_allowed: boolean; delete_reason: string;
   schedule: { enabled: boolean; mode: string; minute: number; times: string[] } | null;
   execution: { scheduled_runs: number; successes: number; failures: number; interrupted: number; running: number;
@@ -145,10 +147,11 @@ export function AdminPanel() {
       <p className="admin-explainer"><ShieldCheck size={16} aria-hidden="true" />仅管理员可见。凭据状态表示是否已录入；统计仅包含定时执行，不包含手动操作和只查询验证。</p>
       {notice && <p className={notice.cleanup_pending ? 'management-error' : 'management-success'} role="status">{notice.message}</p>}
       {error ? <div className="empty" role="alert">{error}<button className="text-btn" onClick={() => setRetry(n => n + 1)}>重新加载列表</button></div> : busy ? <div className="management-loading" role="status">正在读取用户及执行记录…</div> : !data?.items.length ? <div className="empty"><b>当前没有注册用户</b><span>用户注册后会自动出现在这里。</span></div> : <>
-        <div className="admin-table-wrap"><table className="admin-table"><caption className="sr-only">注册用户及定时任务执行概览</caption><thead><tr><th scope="col">用户</th><th scope="col">Token</th><th scope="col">定时计划</th><th scope="col">定时执行</th><th scope="col">最近结果</th><th scope="col">操作</th></tr></thead><tbody>{data.items.map(user => <tr key={user.id}>
+        <div className="admin-table-wrap"><table className="admin-table"><caption className="sr-only">注册用户及定时任务执行概览</caption><thead><tr><th scope="col">用户</th><th scope="col">绑定角色</th><th scope="col">定时计划</th><th scope="col">定时执行</th><th scope="col">最近结果</th><th scope="col">操作</th></tr></thead><tbody>{data.items.map(user => <tr key={user.id}>
           <td data-label="用户"><strong className="admin-username">{user.username}</strong>{user.is_admin && <span className="admin-role">管理员</span>}<small>注册于 {time(user.created)}</small></td>
-          <td data-label="Token"><span className={'badge ' + (user.configured ? 'yes' : '')}>{user.configured ? '已录入' : '未录入'}</span></td>
-          <td data-label="定时计划">{!user.schedule ? '暂不可读取' : <><span>{!user.schedule.enabled ? '已暂停' : user.schedule.mode === 'hourly' ? `每小时第 ${user.schedule.minute} 分钟` : `每天 ${user.schedule.times.join('、')}`}</span>{!user.configured && user.schedule.enabled && <small>等待录入凭据</small>}</>}</td>
+          <td data-label="绑定角色"><span className={'badge ' + (user.configured ? 'yes' : '')}>{user.configured ? `${user.game_accounts.length} 个角色` : '未绑定'}</span>
+            {user.game_accounts.length > 0 && <small className="admin-roles">{user.game_accounts.map(item => item.role).join('、')}</small>}</td>
+          <td data-label="定时计划">{!user.schedule ? '暂不可读取' : user.configured ? <><span>{user.enabled_plans > 0 ? `${user.enabled_plans} / ${user.game_accounts.length} 个角色已启用` : '全部角色已暂停'}</span><small>{user.schedule.mode === 'hourly' ? '每小时模式' : '每日定点模式'} · 各自独立时间</small></> : <><span>{!user.schedule.enabled ? '已暂停' : user.schedule.mode === 'hourly' ? `每小时第 ${user.schedule.minute} 分钟` : `每天 ${user.schedule.times.join('、')}`}</span><small>等待绑定角色</small></>}</td>
           <td data-label="定时执行">{!user.execution.stats_available ? '暂不可读取' : <><b>{user.execution.scheduled_runs} 次</b><small>成功 {user.execution.successes} · 失败 {user.execution.failures}{user.execution.interrupted > 0 && ` · 中断 ${user.execution.interrupted}`}{user.execution.running > 0 && ` · 执行中 ${user.execution.running}`}</small></>}</td>
           <td data-label="最近结果">{!user.execution.stats_available ? '暂不可读取' : user.execution.last_run ? <><span className={'run-outcome ' + user.execution.last_run.outcome}>{outcomes[user.execution.last_run.outcome] || '未知'}</span><small>{time(user.execution.last_run.started)}</small></> : '尚未定时执行'}</td>
           <td data-label="操作">{user.delete_allowed ? <Button className="delete-user-button" aria-label={`删除账号 ${user.username}`} onClick={() => setDeleting(user)}><Trash2 size={14} aria-hidden="true" />删除</Button> : <small className="delete-protected">{user.delete_reason}</small>}</td>
