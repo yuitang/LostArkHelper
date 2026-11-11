@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlsplit, parse_qs
-from automation import OperationLock, run, error_info, finish_run
+from automation import OperationLock, run, error_info, finish_run, clear_cooldowns
 import store
 import auth
 import accounts
@@ -325,6 +325,8 @@ class Handler(BaseHTTPRequestHandler):
                     if created:
                         accounts.delete(root, saved_id)
                     raise
+                # 凭据刚保存成功：清掉该角色的领奖冷却，否则换了新 token 仍要等冷却到期才重试。
+                clear_cooldowns(accounts.account_dir(root, saved_id))
                 # 已持有该账号的操作锁，且凭据保存成功；允许用新凭据重新查询后执行。
                 # 校验失败、身份不符或写入失败时不会执行到这里，原待确认记录仍保留。
                 pending = accounts.pending_file(root, saved_id)

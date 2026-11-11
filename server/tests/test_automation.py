@@ -149,6 +149,17 @@ class AutomationTests(unittest.TestCase):
         automation.run(api, {}, self.root)
         self.assertEqual(len(api.calls), 3)
 
+    def test_cooldown_cleared_when_credentials_are_updated(self):
+        # 更新 token 就是为了让它能领到，冷却不能把这次修复挡住。
+        api = FakeAPI([task(3, 1)], reject=True)
+        for _ in range(2):
+            automation.run(api, {}, self.root)
+        self.assertTrue(automation.REJECTED)
+        automation.clear_cooldowns(self.root)
+        self.assertFalse(automation.REJECTED)
+        automation.run(api, {}, self.root)
+        self.assertEqual(len(api.calls), 3)
+
     def test_database_commits_rolls_back_and_closes(self):
         with store.connect(self.root) as db:
             db.execute("INSERT INTO settings VALUES (1, '{}')")

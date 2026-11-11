@@ -47,6 +47,13 @@ REJECT_COOLDOWN = 6 * 3600
 REJECTED = {}
 
 
+def clear_cooldowns(scope):
+    """凭据更新成功后清掉该角色的领奖冷却：用户已经换了新 token，不该再等冷却到期。"""
+    scope = str(scope)
+    for key in [k for k in REJECTED if k[0] == scope]:
+        REJECTED.pop(key, None)
+
+
 class OperationLock:
     def __init__(self, root, filename='operations.lock'):
         self.path = Path(root) / filename
