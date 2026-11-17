@@ -34,10 +34,9 @@ else:
 # 超时、连接中断、返回非 JSON 属于「结果未知」，必须保留待确认记录，避免重复领取。
 DEFINITIVE = frozenset({'outer_response', 'business', 'auth_mismatch'})
 
-# 自动执行允许领取的任务类别（列表里的 type 字段）：1=每日，2=每周。
-# 领奖接口的 type 参数恒为 1，与任务类别无关——每日任务与每周任务都已验证；
-# 3=活动累计（7~12 号）还没有自动领取的实证，继续只提示、不自动提交。
-AUTO_TASK_TYPES = frozenset({1, 2})
+# 自动执行允许领取的任务类别（列表里的 type 字段）：1=每日，2=每周，3=活动累计。
+# 领奖接口的 type 参数恒为 1，与任务类别无关——每日、每周、活动累计三类均已实测领取成功。
+AUTO_TASK_TYPES = frozenset({1, 2, 3})
 
 # 同一任务被服务端明确拒绝到此次数后进入冷却，冷却到期再试一次；成功则计数清零。
 # 调度器每 30 秒一轮，对参数不匹配的任务反复试错有触发风控的风险；
@@ -217,7 +216,10 @@ def run(helper, config, root, check_only=False, report=None, allow_sign=True, al
             continue
         def confirmed():
             after = [t for t in helper.tasks(config) if t['id'] == tid]
-            return len(after) == 1 and after[0]['status'] == 2
+            # 提交前已确认 status=1（可领取）。提交后只要不再是「可领取」就说明状态确实变了：
+            # 一次性任务变 2（已领取）；阶段型任务（如「小队登录游戏 2/4」）领完推进下一档、
+            # 状态回到 0。只认 2 会把阶段型任务的成功误判成未确认，并留下待确认记录锁住账号。
+            return len(after) == 1 and after[0]['status'] != 1
         outcome = mutate(tid, lambda: helper.request(config, helper.CLAIM,
                          {'task_id': str(tid), 'type': str(helper.VERIFIED[tid])}), confirmed)
         if outcome == 'unknown':
@@ -312,7 +314,7 @@ def execute_user(root, helper, check_only=False, run_now=False, notify=None, acc
                 if not isinstance(config, dict):
                     raise ValueError('账号凭据格式无效')
                 # 该角色的待确认记录放在自己的目录里，不同角色之间不会互相阻塞。
-                # 自动执行领每日与每周任务；活动任务（3）还没取得自动领取实证，仍只提示。
+                # 自动执行领取每日、每周与活动累计三类任务。
                 code = run(helper, config, root, check_only, report, auto_types=AUTO_TASK_TYPES,
                            state_dir=accounts.account_dir(root, item['id']))
             except Exception as exc:

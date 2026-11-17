@@ -18,11 +18,13 @@ class FakeAPI:
     VERIFIED = helper.VERIFIED
     ApiError = helper.ApiError
 
-    def __init__(self, items, signed=True, uncertain=False, reject=False):
+    def __init__(self, items, signed=True, uncertain=False, reject=False, advances=False):
         self.items = items
         self.signed = signed
         self.uncertain = uncertain
         self.reject = reject
+        # advances=True 模拟阶段型任务：领完推进下一档，状态回到 0 而不是 2。
+        self.advances = advances
         self.calls = []
 
     def sign_status(self, config):
@@ -45,7 +47,7 @@ class FakeAPI:
         else:
             for t in self.items:
                 if t['id'] == int(extra['task_id']):
-                    t['status'] = 2
+                    t['status'] = 0 if self.advances else 2
 
 
 def task(tid, status):
@@ -121,15 +123,27 @@ class AutomationTests(unittest.TestCase):
         api2 = FakeAPI([task(6, 0)])
         self.assertEqual(automation.run(api2, {}, self.root), 0)
 
-    def test_auto_run_claims_daily_and_weekly_but_not_activity(self):
-        # 列表 type：1=每日 2=每周 3=活动累计。自动执行提交前两类，活动任务只提示。
+    def test_auto_run_claims_daily_weekly_and_activity(self):
+        # 列表 type：1=每日 2=每周 3=活动累计。领奖参数恒为 1，三类都已实测可领，全部自动提交。
         items = [dict(task(1, 1), type=1), dict(task(3, 1), type=2), dict(task(7, 1), type=3)]
         api = FakeAPI(items)
         report = {}
         self.assertEqual(automation.run(api, {}, self.root, report=report,
                                         auto_types=automation.AUTO_TASK_TYPES), 0)
-        self.assertEqual([call[1]['task_id'] for call in api.calls], ['1', '3'])
-        self.assertEqual([(s['id'], s['reason']) for s in report['skipped']], [(7, 'manual_only')])
+        self.assertEqual([call[1]['task_id'] for call in api.calls], ['1', '3', '7'])
+        self.assertEqual(report['skipped'], [])
+        self.assertEqual([c['id'] for c in report['claimed']], [1, 3, 7])
+
+    def test_stage_task_that_advances_counts_as_claimed(self):
+        # 阶段型任务（小队登录游戏 2/4）领完推进下一档，状态回到 0 而不是 2。
+        # 这仍是成功，不能记成「结果未确认」，否则会留下待确认记录把账号锁死。
+        api = FakeAPI([dict(task(13, 1), type=1)], advances=True)
+        report = {}
+        self.assertEqual(automation.run(api, {}, self.root, report=report,
+                                        auto_types=automation.AUTO_TASK_TYPES), 0)
+        self.assertEqual([c['id'] for c in report['claimed']], [13])
+        self.assertEqual(report['errors'], [])
+        self.assertFalse((self.root/'pending-operation.json').exists())
 
     def test_repeatedly_rejected_task_is_not_resubmitted(self):
         # 服务器明确拒绝到阈值后进入冷却，避免调度器每 30 秒对同一任务反复试错。
